@@ -16,9 +16,21 @@ _Avoid_: Job, queue
 The spoken text returned by a speech model without timestamps, speaker labels, translation, correction, or summarization.
 _Avoid_: Raw transcript, basic transcript
 
+**Transcript Result**:
+The versioned record produced for one source media file, containing its status, transcript variants, provenance, and diagnostics.
+_Avoid_: Output, response
+
+**Transcript Variant**:
+One rendering of the speech within a transcript result, such as the original-language transcript or English translation.
+_Avoid_: Version, track
+
 **Segment**:
-A contiguous portion of a transcript associated with a start and end time supplied by the speech model.
+A contiguous portion of a transcript variant associated with an interval on the source-media timeline.
 _Avoid_: Chunk, cue
+
+**Speaker**:
+An anonymous, file-local participant label assigned by speaker diarization.
+_Avoid_: Person, identity
 
 **Speaker Diarization**:
 The assignment of anonymous speaker labels and speaking times to transcript segments.
