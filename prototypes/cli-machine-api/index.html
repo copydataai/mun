@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="icon" href="data:,">
+  <title>Mun machine protocol prototype</title>
+  <style>
+    :root{color-scheme:dark;--bg:#101211;--panel:#181b19;--line:#303531;--text:#f2f5f2;--muted:#9ea7a0;--accent:#b7f34a;--warn:#ffcf67;--bad:#ff8c82;font:15px/1.45 Inter,system-ui,sans-serif}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text)}button{font:inherit;cursor:pointer}.shell{max-width:1180px;margin:auto;padding:44px 28px 90px}.eyebrow{color:var(--accent);font-size:12px;font-weight:800;letter-spacing:.12em;text-transform:uppercase}h1{font-size:clamp(35px,5vw,64px);letter-spacing:-.055em;line-height:1;margin:10px 0 15px;max-width:850px}h2,h3,p{margin-top:0}.lede{color:var(--muted);font-size:18px;max-width:780px}.question{border-left:3px solid var(--accent);padding:14px 17px;margin:28px 0 36px;background:#171b16}.layout{display:grid;grid-template-columns:1.15fr .85fr;gap:28px}.panel{border-top:1px solid var(--line);padding-top:20px}.state-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line);border:1px solid var(--line)}.fact{background:var(--panel);padding:15px}.fact small{display:block;color:var(--muted);text-transform:uppercase;letter-spacing:.07em}.fact strong{display:block;margin-top:5px;overflow-wrap:anywhere}.good{color:var(--accent)}.warn{color:var(--warn)}.bad{color:var(--bad)}.actions{display:flex;flex-wrap:wrap;gap:8px}.btn{border:1px solid var(--line);background:transparent;color:var(--text);border-radius:6px;padding:10px 13px}.btn:hover{border-color:var(--accent)}.btn:focus-visible{outline:3px solid var(--accent);outline-offset:2px}.btn.primary{background:var(--accent);border-color:var(--accent);color:#10130d;font-weight:800}.btn.danger{color:var(--bad)}.btn:disabled{opacity:.4;cursor:not-allowed}.files{list-style:none;padding:0;margin:14px 0}.files li{display:grid;grid-template-columns:1fr auto;gap:12px;padding:11px 0;border-bottom:1px solid var(--line)}.files span{color:var(--muted)}.wire{background:#090a09;border:1px solid var(--line);padding:14px;height:440px;overflow:auto;white-space:pre-wrap;font:12px/1.55 ui-monospace,SFMono-Regular,monospace;color:#c9d0ca}.wire .in{color:#8fc8ff}.wire .out{color:var(--accent)}.wire .err{color:var(--bad)}.tabs{display:flex;gap:5px;flex-wrap:wrap;margin:42px 0 18px}.tab{background:transparent;border:0;border-bottom:2px solid transparent;color:var(--muted);padding:10px}.tab.active{border-color:var(--accent);color:var(--text)}.scenario{border-top:1px solid var(--line);padding-top:20px}.steps{display:flex;flex-wrap:wrap;gap:8px;align-items:center}.step{display:flex;align-items:center;gap:8px}.step:not(:last-child)::after{content:'→';color:var(--muted)}.note{color:var(--muted)}code{color:var(--accent)}@media(max-width:800px){.layout{grid-template-columns:1fr}.state-grid{grid-template-columns:1fr 1fr}.wire{height:330px}}@media(max-width:460px){.state-grid{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+<main class="shell">
+  <div class="eyebrow">Throwaway logic prototype</div>
+  <h1>Can Electron drive Mun without knowing Python?</h1>
+  <p class="lede">Press actions in any order and watch the engine state and exact wire messages. This tests whether one versioned, line-by-line protocol can handle discovery, progress, cancellation, partial results, bad input, and engine failure.</p>
+  <div class="question"><strong>Proposed seam:</strong> Electron starts <code>mun machine --protocol 1</code>. Each stdin line is one request; each stdout line is one response or event. Human-facing commands remain unchanged.</div>
+
+  <section class="layout">
+    <div>
+      <div class="panel"><h2>Current engine state</h2><div class="state-grid" id="facts"></div></div>
+      <div class="panel" style="margin-top:26px"><h2>Free play</h2><div class="actions" id="actions"></div></div>
+      <div class="panel" style="margin-top:26px"><h2>Source media</h2><ul class="files" id="files"></ul></div>
+      <p class="note" id="change">No action yet.</p>
+    </div>
+    <div class="panel"><h2>Protocol stream</h2><p class="note">Blue is Electron → Mun. Green is Mun → Electron. Red is an engine diagnostic.</p><div class="wire" id="wire" aria-live="polite"></div></div>
+  </section>
+
+  <div class="tabs" id="tabs" role="tablist"></div>
+  <section class="scenario"><h2 id="scenario-title"></h2><p class="note" id="scenario-copy"></p><div class="steps" id="steps"></div></section>
+</main>
+<script>
+  // Portable prototype module: pure state + action -> state transition.
+  const Protocol=(()=>{
+    const media=()=>[
+      {name:'interview.mp3',status:'waiting',progress:0,result:null},
+      {name:'damaged.mov',status:'waiting',progress:0,result:null},
+      {name:'meeting.wav',status:'waiting',progress:0,result:null}
+    ];
+    const initial=()=>({connection:'stopped',protocol:null,compatible:null,request:0,operation:null,sequence:0,phase:'idle',media:media(),wire:[],lastChange:'Ready to start the engine.'});
+    const line=(direction,payload)=>({direction,payload:typeof payload==='string'?payload:JSON.stringify(payload)});
+    const nextRequest=s=>s.request+1;
+    function reduce(previous,action){
+      const s=structuredClone(previous),id=nextRequest(s);s.request=id;
+      if(action.type==='reset')return initial();
+      if(action.type==='connect'){
+        s.connection='ready';s.protocol='mun.machine/v1';s.compatible=true;s.phase='idle';
+        s.wire.push(line('in',{protocol:'mun.machine/v1',id,command:'hello',params:{client:'electron',version:'0.1.0'}}));
+        s.wire.push(line('out',{protocol:'mun.machine/v1',id,ok:true,result:{engine:'0.1.0',protocols:[1],capabilities:['models','transcribe','cancel','resume']}}));
+        s.lastChange='Handshake succeeded. Electron may now send commands.';return s;
+      }
+      if(action.type==='mismatch'){
+        s.connection='incompatible';s.protocol='mun.machine/v2';s.compatible=false;s.phase='blocked';
+        s.wire.push(line('in',{protocol:'mun.machine/v2',id,command:'hello',params:{client:'electron'}}));
+        s.wire.push(line('out',{protocol:'mun.machine/v1',id,ok:false,error:{code:'protocol_unsupported',message:'Protocol 2 is not supported.',details:{supported:[1]}}}));
+        s.lastChange='Version mismatch blocked all work before state could change.';return s;
+      }
+      if(action.type==='invalid'){
+        s.wire.push(line('in',{protocol:'mun.machine/v1',id,command:'transcribe.start',params:{sources:[]}}));
+        s.wire.push(line('out',{protocol:'mun.machine/v1',id,ok:false,error:{code:'invalid_request',message:'At least one source is required.',path:'params.sources'}}));
+        s.lastChange='Bad input returned a correlated error; the engine stayed available.';return s;
+      }
+      if(s.connection!=='ready'){
+        s.wire.push(line('err','command rejected locally: engine is not ready'));
+        s.lastChange='The action was illegal because no compatible handshake exists.';return s;
+      }
+      if(action.type==='discover'){
+        s.wire.push(line('in',{protocol:'mun.machine/v1',id,command:'capabilities.get',params:{}}));
+        s.wire.push(line('out',{protocol:'mun.machine/v1',id,ok:true,result:{offline:true,devices:[{id:'mps',status:'eligible'}],formats:['txt','md','json','jsonc','srt','vtt'],features:['timestamps','translation','diarization']}}));
+        s.lastChange='Electron learned capabilities without importing engine code.';return s;
+      }
+      if(action.type==='start'){
+        if(s.operation){s.wire.push(line('out',{protocol:'mun.machine/v1',id,ok:false,error:{code:'busy',message:'One operation already owns the model.'}}));s.lastChange='A second batch was rejected without disturbing the active one.';return s}
+        s.operation='op-01';s.sequence=0;s.phase='running';s.media=media();
+        s.wire.push(line('in',{protocol:'mun.machine/v1',id,command:'transcribe.start',params:{sources:s.media.map(x=>x.name),model:'openai/whisper-large-v3-turbo',formats:['txt','json']}}));
+        s.wire.push(line('out',{protocol:'mun.machine/v1',id,ok:true,result:{operation:'op-01',accepted:3}}));
+        s.lastChange='Batch accepted. Later progress uses the operation ID, not the request ID.';return s;
+      }
+      if(action.type==='progress'){
+        if(!s.operation){s.lastChange='No active batch can advance.';return s}
+        const current=s.media.find(x=>x.status==='running')||s.media.find(x=>x.status==='waiting');
+        if(!current){s.lastChange='Every source already reached a terminal state.';return s}
+        if(current.status==='waiting'){current.status='running';current.progress=35}else if(current.name==='damaged.mov'){current.status='failed';current.progress=35;current.result='media_unreadable'}else{current.status='completed';current.progress=100;current.result=current.name.replace(/\.[^.]+$/,'.txt')}
+        s.sequence++;
+        s.wire.push(line('out',{protocol:'mun.machine/v1',event:'operation.progress',operation:s.operation,sequence:s.sequence,data:{source:current.name,status:current.status,progress:current.progress,result:current.result}}));
+        const pending=s.media.some(x=>['waiting','running'].includes(x.status));
+        if(!pending){s.sequence++;s.phase='partial';s.wire.push(line('out',{protocol:'mun.machine/v1',event:'operation.completed',operation:s.operation,sequence:s.sequence,data:{status:'partial',completed:2,failed:1}}));s.operation=null}
+        s.lastChange=`${current.name} moved to ${current.status}; prior outputs were preserved.`;return s;
+      }
+      if(action.type==='cancel'){
+        if(!s.operation){s.wire.push(line('out',{protocol:'mun.machine/v1',id,ok:false,error:{code:'not_running',message:'No operation is active.'}}));s.lastChange='Cancellation was safely rejected because nothing is running.';return s}
+        s.wire.push(line('in',{protocol:'mun.machine/v1',id,command:'operation.cancel',params:{operation:s.operation}}));s.wire.push(line('out',{protocol:'mun.machine/v1',id,ok:true,result:{operation:s.operation,cancellation:'requested'}}));
+        s.media.filter(x=>['waiting','running'].includes(x.status)).forEach(x=>x.status='cancelled');s.sequence++;s.wire.push(line('out',{protocol:'mun.machine/v1',event:'operation.completed',operation:s.operation,sequence:s.sequence,data:{status:'cancelled',preserved:s.media.filter(x=>x.status==='completed').length}}));s.operation=null;s.phase='cancelled';s.lastChange='Cancellation completed cooperatively; completed outputs remain usable.';return s;
+      }
+      if(action.type==='crash'){
+        s.connection='crashed';s.phase=s.operation?'interrupted':'idle';s.media.filter(x=>x.status==='running').forEach(x=>x.status='interrupted');s.wire.push(line('err','engine exited unexpectedly (signal: SIGKILL)'));s.operation=null;s.lastChange='The stream ended. Electron can restart the engine and reconcile outputs from disk.';return s;
+      }
+      return s;
+    }
+    return {initial,reduce};
+  })();
+
+  const actions=[['connect','Start engine'],['discover','Discover capabilities'],['start','Start batch'],['progress','Advance work'],['cancel','Cancel batch'],['invalid','Send bad request'],['crash','Crash engine'],['mismatch','Use protocol 2'],['reset','Reset demo']];
+  const scenarios={
+    happy:{title:'Happy path with one bad file',copy:'Watch one operation continue after a source failure and finish partial with two usable outputs.',steps:['connect','discover','start','progress','progress','progress','progress','progress','progress']},
+    cancel:{title:'Cancel after preserving work',copy:'Complete the first source, begin the next, then cancel. Cancellation is a request followed by a terminal event.',steps:['connect','start','progress','progress','progress','cancel']},
+    invalid:{title:'Bad input does not poison the stream',copy:'A structured validation error is correlated to its request; a valid discovery request still works afterward.',steps:['connect','invalid','discover']},
+    mismatch:{title:'Incompatible desktop and engine',copy:'The handshake fails before any operation starts and reports the versions the engine understands.',steps:['mismatch','start']},
+    crash:{title:'Engine disappears mid-batch',copy:'The operating-system process exit is separate from protocol errors. Completed files remain on disk; in-flight work is interrupted.',steps:['connect','start','progress','progress','progress','crash']}
+  };
+  let state=Protocol.initial(),scenario='happy',step=0;
+  const $=q=>document.querySelector(q);
+  function dispatch(type){state=Protocol.reduce(state,{type});$('#change').textContent=state.lastChange;render()}
+  function render(){
+    const terminal=state.media.filter(x=>['completed','failed','cancelled'].includes(x.status)).length;
+    $('#facts').innerHTML=[['Process',state.connection],['Protocol',state.protocol||'—'],['Compatible',state.compatible===null?'unknown':String(state.compatible)],['Phase',state.phase],['Operation',state.operation||'—'],['Terminal files',`${terminal} / ${state.media.length}`]].map(([k,v])=>`<div class="fact"><small>${k}</small><strong class="${v==='ready'||v==='true'||v==='completed'?'good':v==='incompatible'||v==='crashed'||v==='false'?'bad':''}">${v}</strong></div>`).join('');
+    $('#actions').innerHTML=actions.map(([type,label])=>`<button class="btn ${type==='connect'?'primary':type==='crash'?'danger':''}" data-action="${type}">${label}</button>`).join('');
+    $('#files').innerHTML=state.media.map(x=>`<li><strong>${x.name}</strong><span>${x.status}${x.progress?' · '+x.progress+'%':''}${x.result?' · '+x.result:''}</span></li>`).join('');
+    $('#wire').innerHTML=state.wire.map(x=>`<span class="${x.direction}">${x.direction==='in'?'IN  ':x.direction==='out'?'OUT ':'ERR '}${escapeHtml(x.payload)}</span>`).join('\n');$('#wire').scrollTop=$('#wire').scrollHeight;
+    $('#tabs').innerHTML=Object.entries(scenarios).map(([id,s])=>`<button class="tab ${id===scenario?'active':''}" data-tab="${id}" role="tab" aria-selected="${id===scenario}">${s.title}</button>`).join('');
+    const active=scenarios[scenario];$('#scenario-title').textContent=active.title;$('#scenario-copy').textContent=active.copy;
+    $('#steps').innerHTML=active.steps.map((type,i)=>`<span class="step"><button class="btn ${i===step?'primary':''}" data-step="${i}" ${i>step?'disabled':''}>${i+1}. ${actions.find(x=>x[0]===type)[1]}</button></span>`).join('');
+    bind();
+  }
+  function escapeHtml(value){const span=document.createElement('span');span.textContent=value;return span.innerHTML}
+  function bind(){document.querySelectorAll('[data-action]').forEach(b=>b.onclick=()=>dispatch(b.dataset.action));document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{scenario=b.dataset.tab;state=Protocol.initial();step=0;$('#change').textContent='Scenario reset to a known state.';render()});document.querySelectorAll('[data-step]').forEach(b=>b.onclick=()=>{const i=Number(b.dataset.step);if(i!==step)return;dispatch(scenarios[scenario].steps[i]);step++;render()})}
+  render();
+</script>
+</body>
+</html>
