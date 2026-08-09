@@ -52,6 +52,14 @@ _Avoid_: Supported model
 A compatible model whose pinned revision and capabilities have been verified by the Mun project.
 _Avoid_: Recommended model
 
+**Model Recommendation**:
+The speech model Mun selects from the user's task, spoken language, priority, and detected hardware, with evidence and resource estimates shown separately.
+_Avoid_: Best model, tested model
+
+**Eligible Model**:
+A model whose exact artifact, runtime, device, precision, and requested capability tuple may work according to metadata and Mun's compatibility rules, but lacks qualifying physical evidence.
+_Avoid_: Tested model, guaranteed model
+
 **Capability**:
 A verified behavior of a speech model, such as timestamps, language selection, language detection, or English translation.
 _Avoid_: Feature
