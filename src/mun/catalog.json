@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "models": [
+    {
+      "id": "openai/whisper-small",
+      "revision": "973afd24965f72e36ca33b3055d56a652f456b4d",
+      "family": "whisper",
+      "quality": "balanced",
+      "languages": "multilingual (99 languages)",
+      "capabilities": ["transcription", "timestamps", "language-selection", "english-translation"],
+      "license": "apache-2.0",
+      "weights_bytes": 967000000,
+      "memory": {"value": "about 2.5 GiB", "provenance": "estimated"},
+      "tested": {"device": "unverified", "note": "Pinned from the official Transformers model repository."}
+    }
+  ]
+}
