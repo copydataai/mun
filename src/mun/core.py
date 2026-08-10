@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from .errors import MunError
-from .models import InstalledModel, mark_model_invalid
+from .models import InstalledModel
 
 MEDIA_EXTENSIONS = {
     ".aac", ".aiff", ".alac", ".avi", ".flac", ".m4a", ".mkv", ".mov", ".mp3",
@@ -105,20 +105,19 @@ def load_pipeline(model: InstalledModel, requested_device: str = "auto") -> tupl
         from transformers import AutoConfig, pipeline
 
         device = detect_device(requested_device, torch)
-        model_type = AutoConfig.from_pretrained(model.path, local_files_only=True).model_type
+        config = AutoConfig.from_pretrained(model.path, local_files_only=True)
         dtype = torch.float16 if device.startswith("cuda") else torch.float32
         pipeline_device: str | int = device if device != "cpu" else -1
         speech_pipeline = pipeline(
             "automatic-speech-recognition",
             model=model.path,
+            config=config,
             device=pipeline_device,
             dtype=dtype,
             trust_remote_code=model.trust_remote_code,
-            model_kwargs={"local_files_only": True},
         )
-        return speech_pipeline, device, model_type
+        return speech_pipeline, device, config.model_type
     except Exception as exc:
-        mark_model_invalid(model)
         raise MunError(f"Could not load {model.id}: {exc}") from exc
 
 

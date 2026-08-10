@@ -189,12 +189,6 @@ def model_details(root: Path, target: str) -> dict[str, Any]:
     return {"installed": asdict(model), "catalog": catalog}
 
 
-def mark_model_invalid(model: InstalledModel) -> None:
-    path = Path(model.path)
-    if (path / METADATA_FILE).is_file():
-        _write_metadata(path, InstalledModel(**{**asdict(model), "status": "invalid"}))
-
-
 def _read_metadata(path: Path) -> InstalledModel:
     metadata_path = path / METADATA_FILE
     try:
