@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import unittest
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -185,6 +186,40 @@ class TranscriptContractTests(unittest.TestCase):
                 )
             self.assertEqual(load_pipeline.call_count, 0)
             self.assertEqual(summaries[0].status, "partial")
+            self.assertEqual(failures, [])
+
+    def test_run_batch_parallel_skips_fast_path_is_not_inflated_by_runtime_setup(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as temporary:
+            media = []
+            for index in range(20):
+                source = Path(temporary) / f"file-{index}.wav"
+                source.write_bytes(b"audio")
+                (Path(temporary) / f"file-{index}.txt").write_text("cached", encoding="utf-8")
+                media.append(SourceMedia(source, Path(source.name)))
+
+            def blocking_load_pipeline(*_args, **_kwargs):
+                time.sleep(0.05)
+                raise RuntimeError("runtime load should be skipped")
+
+            start = time.perf_counter()
+            with patch("mun.core.load_pipeline", side_effect=blocking_load_pipeline) as load_pipeline:
+                summaries, failures = run_batch(
+                    media,
+                    self.model,
+                    Path(temporary),
+                    ["txt"],
+                    TranscriptionOptions(),
+                    False,
+                    lambda _: None,
+                    jobs=4,
+                )
+            elapsed = time.perf_counter() - start
+
+            self.assertEqual(load_pipeline.call_count, 0)
+            self.assertLess(elapsed, 0.20)
+            self.assertEqual([item.status for item in summaries], ["partial"] * len(media))
             self.assertEqual(failures, [])
 
 
