@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -64,6 +65,27 @@ class TranscriptionOptions:
     chunk_length: int = 30
     stride_length: int = 5
     device: str = "auto"
+
+
+_WORKER_RUNTIME: Any | None = None
+_WORKER_MODEL: InstalledModel | None = None
+_WORKER_OPTIONS: TranscriptionOptions | None = None
+
+
+def _init_batch_worker(model: InstalledModel, options: TranscriptionOptions) -> None:
+    from .runtime import create_transformers_runtime
+
+    global _WORKER_RUNTIME, _WORKER_MODEL, _WORKER_OPTIONS
+    _WORKER_RUNTIME = create_transformers_runtime(model, options.device)
+    _WORKER_MODEL = model
+    _WORKER_OPTIONS = options
+
+
+def _run_batch_worker(payload: tuple[int, SourceMedia]) -> tuple[int, TranscriptResult]:
+    index, media = payload
+    if _WORKER_RUNTIME is None or _WORKER_MODEL is None or _WORKER_OPTIONS is None:
+        raise MunError("Batch worker is not initialized")
+    return index, transcribe_source(_WORKER_RUNTIME, media, _WORKER_MODEL, _WORKER_OPTIONS)
 
 
 def discover_media(
@@ -160,11 +182,68 @@ def run_batch(
     overwrite: bool,
     progress: Callable[[str], None],
     runtime: Any | None = None,
+    jobs: int = 1,
 ) -> tuple[list[TranscriptResult], list[dict[str, str]]]:
     runtime = runtime or load_pipeline(model, options.device)[0]
     summaries: list[TranscriptResult] = []
     failures: list[dict[str, str]] = []
     used_bases: set[Path] = set()
+
+    if jobs < 1:
+        raise MunError("--jobs must be a positive integer")
+
+    jobs = min(jobs, len(media), os.cpu_count() or 1)
+    effective_device = runtime.info.effective_device
+
+    if jobs > 1 and effective_device != "cpu":
+        progress(f"[{jobs} workers requested but effective device is {effective_device}; falling back to single-threaded batch")
+        jobs = 1
+
+    if jobs == 1:
+        for index, item in enumerate(media, start=1):
+            base = output_base(output_dir, item, used_bases)
+            expected = output_paths(base, formats, options.translate)
+            if not overwrite and any(path.exists() for path in expected):
+                progress(f"[{index}/{len(media)}] skipped {item.source} (output exists)")
+                summaries.append(TranscriptResult(
+                    schema_version=SCHEMA_VERSION,
+                    status="partial",
+                    source=SourceRecord(item.source.name, str(item.relative)),
+                    transcripts=[],
+                    speakers=[],
+                    diagnostics=[Diagnostic("warning", "output_exists", "Output already exists", "output", True)],
+                    provenance=_provenance(runtime, model, options),
+                ))
+                continue
+
+            progress(f"[{index}/{len(media)}] transcribing {item.source} ({runtime.info.effective_device}, {model.id})")
+            try:
+                result = transcribe_source(runtime, item, model, options)
+                if result.status == "completed":
+                    write_result_outputs(base, formats, result, options.translate, overwrite=overwrite)
+                summaries.append(result)
+                if result.status == "failed":
+                    failures.append({"source": str(item.relative), "error": result.diagnostics[0].message if result.diagnostics else "failed"})
+                progress(f"[{index}/{len(media)}] complete {item.source}")
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                failures.append({"source": str(item.relative), "error": str(exc)})
+                summaries.append(
+                    TranscriptResult(
+                        schema_version=SCHEMA_VERSION,
+                        status="failed",
+                        source=SourceRecord(item.source.name, str(item.relative)),
+                        transcripts=[],
+                        speakers=[],
+                        diagnostics=[Diagnostic("error", "transcription_failed", "Transcription failed", "transcription", False)],
+                        provenance=_provenance(runtime, model, options),
+                    )
+                )
+                progress(f"[{index}/{len(media)}] failed {item.source}: {exc}")
+        return summaries, failures
+
+    queued: list[tuple[int, SourceMedia, Path]] = []
     for index, item in enumerate(media, start=1):
         base = output_base(output_dir, item, used_bases)
         expected = output_paths(base, formats, options.translate)
@@ -180,20 +259,49 @@ def run_batch(
                 provenance=_provenance(runtime, model, options),
             ))
             continue
-        progress(f"[{index}/{len(media)}] transcribing {item.source} ({runtime.info.effective_device}, {model.id})")
-        try:
-            result = run_transcription_workflow([item], model, options, runtime=runtime)[0]
-            if result.status == "completed":
-                write_result_outputs(base, formats, result, options.translate, overwrite=overwrite)
-            summaries.append(result)
-            if result.status == "failed":
-                failures.append({"source": str(item.relative), "error": result.diagnostics[0].message if result.diagnostics else "failed"})
-            progress(f"[{index}/{len(media)}] complete {item.source}")
-        except KeyboardInterrupt:
-            raise
-        except Exception as exc:
-            failures.append({"source": str(item.relative), "error": str(exc)})
-            progress(f"[{index}/{len(media)}] failed {item.source}: {exc}")
+        queued.append((index, item, base))
+
+    if not queued:
+        return summaries, failures
+
+    completed: dict[int, TranscriptResult] = {}
+    base_by_index = {index: base for index, _, base in queued}
+    media_by_index = {index: item for index, item, _ in queued}
+
+    with ProcessPoolExecutor(max_workers=jobs, initializer=_init_batch_worker, initargs=(model, options)) as executor:
+        futures = {
+            executor.submit(_run_batch_worker, (index, item)): index for index, item, _ in queued
+        }
+        for future in as_completed(futures):
+            index = futures[future]
+            item = media_by_index[index]
+            progress(f"[{index}/{len(media)}] transcribing {item.source} ({runtime.info.effective_device}, {model.id})")
+            try:
+                _, result = future.result()
+            except Exception:
+                result = TranscriptResult(
+                    schema_version=SCHEMA_VERSION,
+                    status="failed",
+                    source=SourceRecord(item.source.name, str(item.relative)),
+                    transcripts=[],
+                    speakers=[],
+                    diagnostics=[Diagnostic("error", "transcription_failed", "Transcription failed", "transcription", False)],
+                    provenance=_provenance(runtime, model, options),
+                )
+
+            completed[index] = result
+
+    ordered = sorted(completed)
+    for index in ordered:
+        result = completed[index]
+        base = base_by_index[index]
+        if result.status == "completed":
+            write_result_outputs(base, formats, result, options.translate, overwrite=overwrite)
+        summaries.append(result)
+        if result.status == "failed":
+            failures.append({"source": str(result.source.relative_path), "error": result.diagnostics[0].message if result.diagnostics else "failed"})
+        progress(f"[{index}/{len(media)}] complete {result.source.name}")
+
     return summaries, failures
 
 

@@ -4,6 +4,8 @@ import json
 import unittest
 from pathlib import Path
 
+from mun.errors import MunError
+
 from mun.core import (
     Segment,
     SourceMedia,
@@ -114,6 +116,26 @@ class TranscriptContractTests(unittest.TestCase):
 
         self.assertEqual([result.status for result in results], ["completed"])
         self.assertEqual(failures, [])
+
+    def test_run_batch_rejects_non_positive_jobs(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "file.wav"
+            source.write_bytes(b"audio")
+            media = SourceMedia(source, Path(source.name))
+            with self.assertRaises(MunError):
+                run_batch(
+                    [media],
+                    self.model,
+                    Path(temporary),
+                    ["txt"],
+                    TranscriptionOptions(),
+                    False,
+                    lambda _: None,
+                    runtime=self.runtime,
+                    jobs=0,
+                )
 
 
 if __name__ == "__main__":

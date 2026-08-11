@@ -59,6 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
     transcribe.add_argument("--offline", action="store_true")
     transcribe.add_argument("--stdout", action="store_true", help="write one TXT or JSON result to stdout")
     transcribe.add_argument("--summary-json", action="store_true", help="write batch summary JSON to stdout")
+    transcribe.add_argument("--jobs", type=int, default=1, help="parallel batch workers (CPU runs only)")
     transcribe.add_argument("--chunk-length", type=int, default=30, help=argparse.SUPPRESS)
     transcribe.add_argument("--stride-length", type=int, default=5, help=argparse.SUPPRESS)
 
@@ -157,7 +158,7 @@ def interactive_wizard() -> int:
         inputs=shlex.split(entered_paths), input_list=None, model=model.id, model_dir=str(root),
         output_dir=output_dir, format=["txt"], timestamps=False, language=None, translate=False,
         include_hidden=False, overwrite=False, device=None, offline=False, stdout=False,
-        summary_json=False, chunk_length=30, stride_length=5,
+        summary_json=False, jobs=1, chunk_length=30, stride_length=5,
     )
     return command_transcribe(args)
 
@@ -192,9 +193,13 @@ def command_transcribe(args: argparse.Namespace) -> int:
         stride_length=args.stride_length,
         device=args.device or config.get("device", "auto"),
     )
+    if args.jobs < 1:
+        raise MunError("--jobs must be a positive integer")
+
     with _offline_environment(args.offline or config.get("offline", False)):
-        runtime = load_pipeline(model, options.device)[0]
+        runtime: Any | None = load_pipeline(model, options.device)[0] if args.jobs == 1 else None
         if args.stdout:
+            runtime = runtime or load_pipeline(model, options.device)[0]
             results = run_transcription_workflow(media, model, options, runtime=runtime)
             result = results[0]
             if result.status != "completed":
@@ -206,7 +211,15 @@ def command_transcribe(args: argparse.Namespace) -> int:
         output_dir = Path(args.output_dir or config.get("output_dir", "transcripts")).expanduser().resolve()
         progress = lambda message: print(message, file=sys.stderr)
         summaries, failures = run_batch(
-            media, model, output_dir, formats, options, args.overwrite, progress, runtime=runtime
+            media,
+            model,
+            output_dir,
+            formats,
+            options,
+            args.overwrite,
+            progress,
+            runtime=runtime,
+            jobs=args.jobs,
         )
         if args.summary_json:
             json.dump(make_batch_result(summaries).to_dict(), sys.stdout, indent=2)
