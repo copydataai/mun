@@ -134,6 +134,36 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(called_source, source)
         self.assertEqual(pipeline.call_args.args[1], prepared)
 
+    def test_is_media_false_when_ffprobe_reports_failure(self) -> None:
+        from mun import core
+
+        core._FFPROBE_CACHE.clear()
+        core._BINARY_PATH_CACHE.clear()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "audio.wav"
+            source.write_bytes(b"audio")
+            fake = type("Result", (), {"returncode": 1, "stdout": ""})()
+
+            with patch("mun.core.subprocess.run", return_value=fake), patch("shutil.which", return_value="/usr/bin/ffprobe"):
+                self.assertFalse(core.is_media(source))
+                self.assertFalse(core._can_use_source_audio_directly(source))
+
+    def test_is_media_false_when_ffprobe_output_is_malformed(self) -> None:
+        from mun import core
+
+        core._FFPROBE_CACHE.clear()
+        core._BINARY_PATH_CACHE.clear()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "audio.wav"
+            source.write_bytes(b"audio")
+            fake = type("Result", (), {"returncode": 0, "stdout": "this is not json"})()
+
+            with patch("mun.core.subprocess.run", return_value=fake), patch("shutil.which", return_value="/usr/bin/ffprobe"):
+                self.assertFalse(core.is_media(source))
+                self.assertFalse(core._can_use_source_audio_directly(source))
+
 
 if __name__ == "__main__":
     unittest.main()
