@@ -8,6 +8,7 @@ import shlex
 import shutil
 import sys
 import contextlib
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -60,6 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
     transcribe.add_argument("--stdout", action="store_true", help="write one TXT or JSON result to stdout")
     transcribe.add_argument("--summary-json", action="store_true", help="write batch summary JSON to stdout")
     transcribe.add_argument("--jobs", type=int, default=1, help="parallel batch workers (CPU runs only)")
+    transcribe.add_argument("--benchmark", action="store_true", help="report elapsed batch time and file throughput")
     transcribe.add_argument("--chunk-length", type=int, default=30, help=argparse.SUPPRESS)
     transcribe.add_argument("--stride-length", type=int, default=5, help=argparse.SUPPRESS)
 
@@ -210,6 +212,7 @@ def command_transcribe(args: argparse.Namespace) -> int:
             return 0
         output_dir = Path(args.output_dir or config.get("output_dir", "transcripts")).expanduser().resolve()
         progress = lambda message: print(message, file=sys.stderr)
+        started_at = time.perf_counter() if args.benchmark else None
         summaries, failures = run_batch(
             media,
             model,
@@ -221,6 +224,15 @@ def command_transcribe(args: argparse.Namespace) -> int:
             runtime=runtime,
             jobs=args.jobs,
         )
+        if args.benchmark and started_at is not None:
+            elapsed = time.perf_counter() - started_at
+            completed = sum(result.status == "completed" for result in summaries)
+            throughput = completed / elapsed if elapsed else 0.0
+            print(
+                f"Benchmark: files={len(media)} completed={completed} failed={len(failures)} "
+                f"duration_s={elapsed:.2f} files_per_s={throughput:.2f} jobs={args.jobs}",
+                file=sys.stderr,
+            )
         if args.summary_json:
             json.dump(make_batch_result(summaries).to_dict(), sys.stdout, indent=2)
             sys.stdout.write("\n")

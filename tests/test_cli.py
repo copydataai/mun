@@ -19,6 +19,10 @@ class CliTests(unittest.TestCase):
         args = build_parser().parse_args(["transcribe", "voice.wav", "--jobs", "4"])
         self.assertEqual(args.jobs, 4)
 
+    def test_transcribe_accepts_benchmark(self) -> None:
+        args = build_parser().parse_args(["transcribe", "voice.wav", "--benchmark"])
+        self.assertTrue(args.benchmark)
+
     def test_no_arguments_without_tty_returns_usage_error(self) -> None:
         error = io.StringIO()
         with contextlib.redirect_stderr(error):

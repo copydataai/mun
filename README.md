@@ -64,9 +64,12 @@ mun transcribe recordings/ meeting.mp4 voice-note.m4a
 mun transcribe --input-list files.txt --format txt --format json
 mun transcribe recordings/ --format srt --format vtt
 mun transcribe recordings/ --jobs 4 --format txt
+mun transcribe recordings/ --jobs 4 --benchmark --format txt
 ```
 
 `--jobs` enables parallel workers for large file batches. For safety, Mun currently uses it only with CPU inference. If you are on an accelerator backend, the flag is ignored and runs in single-process mode.
+
+`--benchmark` prints batch throughput metrics to stderr after the batch completes. This is especially useful for tuning `--jobs` and format mix.
 
 FFmpeg converts each source to private temporary mono audio. Temporary audio is removed after success, failure, or cancellation. By default, one speech model is loaded and inference runs sequentially so concurrent files do not duplicate model memory. Enable `--jobs` for CPU batches when you want higher throughput.
 

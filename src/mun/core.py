@@ -88,6 +88,13 @@ def _run_batch_worker(payload: tuple[int, SourceMedia]) -> tuple[int, Transcript
     return index, transcribe_source(_WORKER_RUNTIME, media, _WORKER_MODEL, _WORKER_OPTIONS)
 
 
+def _media_size_or_zero(media: SourceMedia) -> int:
+    try:
+        return media.source.stat().st_size
+    except OSError:
+        return 0
+
+
 def discover_media(
     raw_paths: Iterable[str],
     include_hidden: bool = False,
@@ -228,7 +235,7 @@ def run_batch(
             except KeyboardInterrupt:
                 raise
             except Exception as exc:
-                failures.append({"source": str(item.relative), "error": str(exc)})
+                failures.append({"source": str(item.relative), "error": "transcription failed"})
                 summaries.append(
                     TranscriptResult(
                         schema_version=SCHEMA_VERSION,
@@ -260,6 +267,8 @@ def run_batch(
             ))
             continue
         queued.append((index, item, base))
+
+    queued.sort(key=lambda entry: _media_size_or_zero(entry[1]), reverse=True)
 
     if not queued:
         return summaries, failures

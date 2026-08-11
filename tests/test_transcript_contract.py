@@ -137,6 +137,32 @@ class TranscriptContractTests(unittest.TestCase):
                     jobs=0,
                 )
 
+    def test_run_batch_failure_does_not_leak_internal_details(self) -> None:
+        import tempfile
+
+        class FailingRuntime:
+            info = self.runtime.info
+
+            def transcribe(self, source, options):
+                raise RuntimeError("secret /private/source.wav")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "file.wav"
+            source.write_bytes(b"audio")
+            media = SourceMedia(source, Path(source.name))
+            summaries, failures = run_batch(
+                [media],
+                self.model,
+                Path(temporary),
+                ["txt"],
+                TranscriptionOptions(),
+                False,
+                lambda _: None,
+                runtime=FailingRuntime(),
+            )
+            self.assertEqual(summaries[0].status, "failed")
+            self.assertFalse(any("private/source.wav" in failure["error"] for failure in failures))
+
 
 if __name__ == "__main__":
     unittest.main()
