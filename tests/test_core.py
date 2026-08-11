@@ -3,15 +3,18 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from mun.core import (
     Segment,
     SourceMedia,
     Transcript,
+    TranscriptionOptions,
     discover_media,
     output_base,
     render_output,
+    transcribe_media,
 )
 from mun.models import InstalledModel
 
@@ -78,6 +81,58 @@ class OutputTests(unittest.TestCase):
 
     def test_vtt_has_header(self) -> None:
         self.assertTrue(render_output("vtt", self.transcript, self.media, self.model, "cpu").startswith("WEBVTT\n"))
+
+
+class ProbeTests(unittest.TestCase):
+    def test_is_media_uses_cached_ffprobe_results(self) -> None:
+        from mun import core
+
+        core._FFPROBE_CACHE.clear()
+        core._BINARY_PATH_CACHE.clear()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "audio.wav"
+            source.write_bytes(b"audio")
+
+            fake = type("Result", (), {"returncode": 0, "stdout": '{"streams": [{"codec_type": "audio", "codec_name": "pcm_s16le", "channels": 1, "sample_rate": "16000"}]}'})()
+
+            with patch("mun.core.subprocess.run", return_value=fake) as run_probe, patch("shutil.which", return_value="/usr/bin/ffprobe"):
+                self.assertTrue(core.is_media(source))
+                self.assertTrue(core._can_use_source_audio_directly(source))
+                self.assertTrue(core.is_media(source))
+                self.assertTrue(core._can_use_source_audio_directly(source))
+
+            self.assertEqual(run_probe.call_count, 1)
+
+    def test_transcribe_media_skips_ffmpeg_when_source_is_ready(self) -> None:
+        ready_path = Path("/tmp/ready.wav")
+        transcript = Transcript("Hello", [Segment("Hello", 0.0, 1.0)], "en")
+
+        with patch("mun.core._can_use_source_audio_directly", return_value=True), patch(
+            "mun.core._convert_media"
+        ) as convert_media, patch("mun.core._run_pipeline", return_value=transcript) as pipeline:
+            result, translated = transcribe_media(object(), ready_path, "whisper", TranscriptionOptions())
+
+        self.assertEqual(result, transcript)
+        self.assertIsNone(translated)
+        convert_media.assert_not_called()
+        self.assertEqual(len(pipeline.mock_calls), 1)
+
+    def test_transcribe_media_converts_when_source_is_not_ready(self) -> None:
+        source = Path("/tmp/raw.audio")
+        prepared = Path("/tmp/prepared.wav")
+        transcript = Transcript("Hello", [Segment("Hello", 0.0, 1.0)], "en")
+
+        with patch("mun.core._can_use_source_audio_directly", return_value=False), patch(
+            "mun.core._audio_input_path", return_value=(prepared, True)
+        ) as audio_input, patch("mun.core._run_pipeline", return_value=transcript) as pipeline:
+            result, _ = transcribe_media(object(), source, "whisper", TranscriptionOptions())
+
+        self.assertEqual(result, transcript)
+        audio_input.assert_called_once()
+        called_source = audio_input.call_args.args[0]
+        self.assertEqual(called_source, source)
+        self.assertEqual(pipeline.call_args.args[1], prepared)
 
 
 if __name__ == "__main__":

@@ -22,7 +22,6 @@ from .core import (
     render_output,
     run_batch,
     run_transcription_workflow,
-    transcribe_media,
 )
 from .errors import MunError
 from .transcript import make_batch_result
@@ -170,10 +169,11 @@ def command_transcribe(args: argparse.Namespace) -> int:
     raw_paths = list(args.inputs)
     if args.input_list:
         try:
-            raw_paths.extend(
-                line.strip() for line in args.input_list.read_text(encoding="utf-8").splitlines()
-                if line.strip() and not line.lstrip().startswith("#")
-            )
+            with args.input_list.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    stripped = line.strip()
+                    if stripped and not stripped.lstrip().startswith("#"):
+                        raw_paths.append(stripped)
         except OSError as exc:
             raise MunError(f"Cannot read input list {args.input_list}: {exc}") from exc
     if not raw_paths:

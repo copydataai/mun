@@ -36,6 +36,17 @@ MEDIA_EXTENSIONS = {
     ".aac", ".aiff", ".alac", ".avi", ".flac", ".m4a", ".mkv", ".mov", ".mp3",
     ".mp4", ".mpeg", ".mpg", ".oga", ".ogg", ".opus", ".wav", ".webm", ".wma",
 }
+_FFPROBE_CACHE: dict[Path, tuple[bool, bool]] = {}
+_BINARY_PATH_CACHE: dict[str, str | None] = {}
+
+
+def _cached_binary_path(name: str, missing_error: str) -> str:
+    if name not in _BINARY_PATH_CACHE:
+        _BINARY_PATH_CACHE[name] = shutil.which(name)
+    path = _BINARY_PATH_CACHE[name]
+    if path is None:
+        raise MunError(missing_error)
+    return path
 
 
 @dataclass(frozen=True)
@@ -97,6 +108,57 @@ def _media_size_or_zero(media: SourceMedia) -> int:
         return 0
 
 
+def _probe_media(path: Path) -> tuple[bool, bool]:
+    """Return (is_audio, is_ready_for_whisper).
+
+    The second result is true when the input can be passed directly to the speech
+    pipeline without a temporary conversion to 16 kHz mono PCM.
+    """
+    key = path.resolve()
+    cached = _FFPROBE_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    ffprobe = _cached_binary_path("ffprobe", "FFprobe is not installed. Install FFmpeg and try again.")
+    result = subprocess.run(
+        [
+            ffprobe, "-v", "error", "-select_streams", "a:0",
+            "-show_entries", "stream=codec_name,channels,sample_rate",
+            "-of", "json",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        _FFPROBE_CACHE[key] = (False, False)
+        return False, False
+
+    is_audio = False
+    is_whisper_ready = False
+    try:
+        payload = json.loads(result.stdout)
+        streams = payload.get("streams", [])
+        if isinstance(streams, list) and streams:
+            stream = streams[0]
+            is_audio = stream.get("codec_type") == "audio" or "codec_type" not in stream
+            channels = int(stream.get("channels", 0))
+            sample_rate = int(stream.get("sample_rate", 0))
+            codec_name = stream.get("codec_name", "")
+            is_whisper_ready = is_audio and channels == 1 and sample_rate == 16_000 and str(codec_name).startswith("pcm")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        is_audio = False
+        is_whisper_ready = False
+
+    _FFPROBE_CACHE[key] = (is_audio, is_whisper_ready)
+    return is_audio, is_whisper_ready
+
+
+def _can_use_source_audio_directly(path: Path) -> bool:
+    return _probe_media(path)[1]
+
+
 def _infer_effective_device(requested_device: str) -> str:
     try:
         import torch
@@ -139,10 +201,9 @@ def discover_media(
             raise MunError(f"Input does not exist: {selected}")
         if selected.is_dir():
             root = selected.resolve()
-            candidates = sorted(root.rglob("*"))
+            candidates = [candidate for candidate in root.rglob("*") if candidate.is_file() and not candidate.is_symlink()]
+            candidates.sort()
             for candidate in candidates:
-                if candidate.is_dir() or candidate.is_symlink():
-                    continue
                 relative_inside = candidate.relative_to(root)
                 if not include_hidden and any(part.startswith(".") for part in relative_inside.parts):
                     continue
@@ -160,18 +221,15 @@ def discover_media(
 
 
 def is_media(path: Path) -> bool:
-    if not shutil.which("ffprobe"):
-        raise MunError("FFprobe is not installed. Install FFmpeg and try again.")
-    result = subprocess.run(
-        [
-            "ffprobe", "-v", "error", "-select_streams", "a:0",
-            "-show_entries", "stream=codec_type", "-of", "default=nw=1:nk=1", str(path),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return result.returncode == 0 and "audio" in result.stdout.splitlines()
+    return _probe_media(path)[0]
+
+
+def _audio_input_path(source: Path, converted: Path) -> tuple[Path, bool]:
+    """Return the path to pass to ASR and whether a temporary conversion was used."""
+    if _can_use_source_audio_directly(source):
+        return source, False
+    _convert_media(source, converted)
+    return converted, True
 
 
 def load_pipeline(model: InstalledModel, requested_device: str = "auto") -> tuple[Any, str, str]:
@@ -200,13 +258,19 @@ def transcribe_media(
         raise MunError(f"The selected {model_type} model cannot provide timestamps")
     if (options.language or options.translate) and model_type != "whisper":
         raise MunError("Language selection and English translation require a Whisper-family model")
-    with tempfile.TemporaryDirectory(prefix="mun-") as temporary_directory:
-        wav_path = Path(temporary_directory) / "audio.wav"
-        _convert_media(source, wav_path)
-        original = _run_pipeline(speech_pipeline, wav_path, model_type, options, task="transcribe")
+    if _can_use_source_audio_directly(source):
+        original = _run_pipeline(speech_pipeline, source, model_type, options, task="transcribe")
         translated = None
         if options.translate:
-            translated = _run_pipeline(speech_pipeline, wav_path, model_type, options, task="translate")
+            translated = _run_pipeline(speech_pipeline, source, model_type, options, task="translate")
+        return original, translated
+
+    with tempfile.TemporaryDirectory(prefix="mun-") as temporary_directory:
+        prepared_audio, _ = _audio_input_path(source, Path(temporary_directory) / "audio.wav")
+        original = _run_pipeline(speech_pipeline, prepared_audio, model_type, options, task="transcribe")
+        translated = None
+        if options.translate:
+            translated = _run_pipeline(speech_pipeline, prepared_audio, model_type, options, task="translate")
         return original, translated
 
 
@@ -558,11 +622,10 @@ def _add_media(
 
 
 def _convert_media(source: Path, destination: Path) -> None:
-    if not shutil.which("ffmpeg"):
-        raise MunError("FFmpeg is not installed. Install FFmpeg and try again.")
+    ffmpeg = _cached_binary_path("ffmpeg", "FFmpeg is not installed. Install FFmpeg and try again.")
     result = subprocess.run(
         [
-            "ffmpeg", "-nostdin", "-v", "error", "-i", str(source), "-map", "0:a:0",
+            ffmpeg, "-nostdin", "-v", "error", "-i", str(source), "-map", "0:a:0",
             "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-y", str(destination),
         ],
         capture_output=True,

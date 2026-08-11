@@ -6,7 +6,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Protocol
 
-from .core import Segment, Transcript, TranscriptionOptions, _convert_media
+from .core import Segment, Transcript, TranscriptionOptions, _audio_input_path, _can_use_source_audio_directly
 from .errors import MunError
 from .models import InstalledModel
 
@@ -62,9 +62,14 @@ class TransformersRuntime:
             raise MunError(f"The selected {model_type} model cannot provide timestamps")
         if (options.language or options.translate) and model_type != "whisper":
             raise MunError("Language selection and English translation require a Whisper-family model")
+        if _can_use_source_audio_directly(source):
+            wav_path = source
+            original = self._run_pipeline(wav_path, options, task="transcribe")
+            translated = self._run_pipeline(wav_path, options, task="translate") if options.translate else None
+            return original, translated
+
         with tempfile.TemporaryDirectory(prefix="mun-") as temporary_directory:
-            wav_path = Path(temporary_directory) / "audio.wav"
-            _convert_media(source, wav_path)
+            wav_path, _ = _audio_input_path(source, Path(temporary_directory) / "audio.wav")
             original = self._run_pipeline(wav_path, options, task="transcribe")
             translated = self._run_pipeline(wav_path, options, task="translate") if options.translate else None
             return original, translated
