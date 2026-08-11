@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from mun.errors import MunError
 
@@ -162,6 +163,29 @@ class TranscriptContractTests(unittest.TestCase):
             )
             self.assertEqual(summaries[0].status, "failed")
             self.assertFalse(any("private/source.wav" in failure["error"] for failure in failures))
+
+    def test_run_batch_parallel_skips_without_loading_model(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "file.wav"
+            source.write_bytes(b"audio")
+            (Path(temporary) / "file.txt").write_text("cached", encoding="utf-8")
+            media = [SourceMedia(source, Path(source.name))]
+            with patch("mun.core.load_pipeline") as load_pipeline:
+                summaries, failures = run_batch(
+                    media,
+                    self.model,
+                    Path(temporary),
+                    ["txt"],
+                    TranscriptionOptions(),
+                    False,
+                    lambda _: None,
+                    jobs=4,
+                )
+            self.assertEqual(load_pipeline.call_count, 0)
+            self.assertEqual(summaries[0].status, "partial")
+            self.assertEqual(failures, [])
 
 
 if __name__ == "__main__":
