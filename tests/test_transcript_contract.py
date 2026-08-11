@@ -11,6 +11,7 @@ from mun.core import (
     TranscriptionOptions,
     output_paths,
     render_output,
+    run_batch,
     run_transcription_workflow,
     write_result_outputs,
 )
@@ -95,6 +96,24 @@ class TranscriptContractTests(unittest.TestCase):
         self.assertEqual(result.status, "failed")
         self.assertNotIn("secret", payload)
         self.assertNotIn("/Users/private", payload)
+
+    def test_batch_reuses_the_supplied_runtime_and_workflow(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as temporary:
+            results, failures = run_batch(
+                [self.media],
+                self.model,
+                Path(temporary),
+                ["json"],
+                TranscriptionOptions(),
+                False,
+                lambda _: None,
+                runtime=self.runtime,
+            )
+
+        self.assertEqual([result.status for result in results], ["completed"])
+        self.assertEqual(failures, [])
 
 
 if __name__ == "__main__":

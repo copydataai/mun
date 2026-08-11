@@ -205,7 +205,9 @@ def command_transcribe(args: argparse.Namespace) -> int:
             return 0
         output_dir = Path(args.output_dir or config.get("output_dir", "transcripts")).expanduser().resolve()
         progress = lambda message: print(message, file=sys.stderr)
-        summaries, failures = run_batch(media, model, output_dir, formats, options, args.overwrite, progress)
+        summaries, failures = run_batch(
+            media, model, output_dir, formats, options, args.overwrite, progress, runtime=runtime
+        )
         if args.summary_json:
             json.dump(make_batch_result(summaries).to_dict(), sys.stdout, indent=2)
             sys.stdout.write("\n")

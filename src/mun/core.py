@@ -159,8 +159,9 @@ def run_batch(
     options: TranscriptionOptions,
     overwrite: bool,
     progress: Callable[[str], None],
+    runtime: Any | None = None,
 ) -> tuple[list[TranscriptResult], list[dict[str, str]]]:
-    runtime = load_pipeline(model, options.device)[0]
+    runtime = runtime or load_pipeline(model, options.device)[0]
     summaries: list[TranscriptResult] = []
     failures: list[dict[str, str]] = []
     used_bases: set[Path] = set()
@@ -181,7 +182,7 @@ def run_batch(
             continue
         progress(f"[{index}/{len(media)}] transcribing {item.source} ({runtime.info.effective_device}, {model.id})")
         try:
-            result = transcribe_source(runtime, item, model, options)
+            result = run_transcription_workflow([item], model, options, runtime=runtime)[0]
             if result.status == "completed":
                 write_result_outputs(base, formats, result, options.translate, overwrite=overwrite)
             summaries.append(result)
