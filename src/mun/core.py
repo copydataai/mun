@@ -211,14 +211,14 @@ def transcribe_source(runtime: Any, media: SourceMedia, model: InstalledModel, o
             diagnostics=[],
             provenance=_provenance(runtime, model, options),
         )
-    except Exception as exc:
+    except Exception:
         return TranscriptResult(
             schema_version=SCHEMA_VERSION,
             status="failed",
             source=SourceRecord(media.source.name, str(media.relative)),
             transcripts=[],
             speakers=[],
-            diagnostics=[Diagnostic("error", "transcription_failed", str(exc), "transcription", False)],
+            diagnostics=[Diagnostic("error", "transcription_failed", "Transcription failed", "transcription", False)],
             provenance=_provenance(runtime, model, options),
         )
 
@@ -252,8 +252,13 @@ def output_base(output_dir: Path, media: SourceMedia, used: set[Path]) -> Path:
 
 
 def output_paths(base: Path, formats: list[str], translated: bool) -> list[Path]:
-    suffixes = [".original", ".en"] if translated else [""]
-    return [Path(f"{base}{suffix}.{format_name}") for suffix in suffixes for format_name in formats]
+    paths: list[Path] = []
+    for format_name in formats:
+        if translated and format_name != "json":
+            paths.extend((Path(f"{base}.original.{format_name}"), Path(f"{base}.en.{format_name}")))
+        else:
+            paths.append(Path(f"{base}.{format_name}"))
+    return paths
 
 
 def write_outputs(
@@ -289,13 +294,15 @@ def write_result_outputs(
     translated: bool,
     overwrite: bool,
 ) -> list[Path]:
-    labels = [("original", "original"), ("en", "english_translation")] if translated else [("", None)]
     written: list[Path] = []
-    for label, kind in labels:
-        if kind and not any(variant.kind == kind for variant in result.transcripts):
-            continue
-        labelled_base = Path(f"{base}.{label}") if label else base
-        for format_name in formats:
+    for format_name in formats:
+        projections = [("", None)]
+        if translated and format_name != "json":
+            projections = [("original", "original"), ("en", "english_translation")]
+        for label, kind in projections:
+            if kind and not any(variant.kind == kind for variant in result.transcripts):
+                continue
+            labelled_base = Path(f"{base}.{label}") if label else base
             path = Path(f"{labelled_base}.{format_name}")
             if path.exists() and not overwrite:
                 raise MunError(f"Output already exists: {path}")
@@ -304,7 +311,16 @@ def write_result_outputs(
                 single = TranscriptResult(**{**result.__dict__, "transcripts": [select_variant(result, kind)]})
             else:
                 single = result
-            _atomic_write(path, render_output(format_name, single, SourceMedia(Path(result.source.name), Path(result.source.relative_path)), InstalledModel(result.provenance.model.repository, result.provenance.model.revision or "", "", ""), result.provenance.effective_device))
+            _atomic_write(
+                path,
+                render_output(
+                    format_name,
+                    single,
+                    SourceMedia(Path(result.source.name), Path(result.source.relative_path)),
+                    InstalledModel(result.provenance.model.repository, result.provenance.model.revision or "", "", ""),
+                    result.provenance.effective_device,
+                ),
+            )
             written.append(path)
     return written
 

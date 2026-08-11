@@ -104,7 +104,7 @@ class TranscriptResult:
     overlap_ms: int = 0
 
     def to_dict(self) -> dict:
-        return _drop_none(asdict(self))
+        return asdict(self)
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), ensure_ascii=False, indent=2) + "\n"
@@ -185,11 +185,3 @@ def _timestamp(milliseconds: int, format_name: str) -> str:
     seconds, millis = divmod(remainder, 1000)
     separator = "," if format_name == "srt" else "."
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}{separator}{millis:03d}"
-
-
-def _drop_none(value):
-    if isinstance(value, dict):
-        return {k: _drop_none(v) for k, v in value.items() if v is not None}
-    if isinstance(value, list):
-        return [_drop_none(v) for v in value]
-    return value
