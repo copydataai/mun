@@ -20,7 +20,7 @@ class InstalledModel:
     revision: str
     path: str
     installed_at: str
-    status: str = "ready"
+    status: str = "installed"
     trust_remote_code: bool = False
 
 
@@ -46,12 +46,12 @@ def installed_models(root: Path) -> list[InstalledModel]:
 
 
 def find_installed(root: Path, model_id: str | None) -> InstalledModel:
-    ready = [model for model in installed_models(root) if model.status == "ready"]
+    ready = [model for model in installed_models(root) if model.status in {"installed", "ready"}]
     if model_id:
         candidate_path = Path(model_id).expanduser()
         if candidate_path.exists():
             metadata = _read_metadata(candidate_path.resolve())
-            if metadata.status != "ready":
+            if metadata.status not in {"installed", "ready"}:
                 raise MunError(f"Model installation is not ready: {candidate_path}")
             return metadata
         ready = [model for model in ready if model.id == model_id or model.path == model_id]
@@ -127,22 +127,25 @@ def download_model(
         if not sha:
             raise MunError(f"Hugging Face did not return an immutable revision for {model_id}")
         existing = [model for model in installed_models(root) if model.id == model_id and model.revision == sha]
-        if existing and existing[-1].status == "ready":
+        if existing and existing[-1].status in {"installed", "ready"}:
             return existing[-1]
         directory = root / f"{_slug(model_id)}--{sha[:12]}"
-        directory.mkdir(parents=True, exist_ok=True)
+        temporary_directory = root / f".{directory.name}.download"
+        if temporary_directory.exists():
+            shutil.rmtree(temporary_directory)
+        temporary_directory.mkdir(parents=True, exist_ok=False)
         model = InstalledModel(
             id=model_id,
             revision=sha,
             path=str(directory),
             installed_at=datetime.now(UTC).isoformat(),
-            status="invalid",
+            status="downloading",
             trust_remote_code=trust_remote_code,
         )
-        _write_metadata(directory, model)
         needed_bytes, ignore_patterns = _download_plan(info.siblings or [])
         free_bytes = shutil.disk_usage(root).free
         if needed_bytes and free_bytes < needed_bytes * 1.1:
+            shutil.rmtree(temporary_directory, ignore_errors=True)
             raise MunError(
                 f"Insufficient disk space: need about {_human_bytes(needed_bytes)}, "
                 f"have {_human_bytes(free_bytes)}"
@@ -150,15 +153,23 @@ def download_model(
         snapshot_download(
             repo_id=model_id,
             revision=sha,
-            local_dir=directory,
+            local_dir=temporary_directory,
             ignore_patterns=ignore_patterns,
         )
-        model = InstalledModel(**{**asdict(model), "status": "ready"})
+        model = InstalledModel(**{**asdict(model), "status": "installed"})
+        _write_metadata(temporary_directory, model)
+        if directory.exists():
+            shutil.rmtree(directory)
+        temporary_directory.replace(directory)
         _write_metadata(directory, model)
         return model
     except MunError:
+        if "temporary_directory" in locals():
+            shutil.rmtree(temporary_directory, ignore_errors=True)
         raise
     except Exception as exc:
+        if "temporary_directory" in locals():
+            shutil.rmtree(temporary_directory, ignore_errors=True)
         raise MunError(f"Model download failed: {exc}") from exc
 
 

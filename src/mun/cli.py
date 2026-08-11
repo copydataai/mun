@@ -7,6 +7,7 @@ import platform
 import shlex
 import shutil
 import sys
+import contextlib
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -19,9 +20,11 @@ from .core import (
     load_pipeline,
     render_output,
     run_batch,
+    run_transcription_workflow,
     transcribe_media,
 )
 from .errors import MunError
+from .transcript import make_batch_result
 from .models import (
     download_model,
     find_installed,
@@ -189,25 +192,27 @@ def command_transcribe(args: argparse.Namespace) -> int:
         stride_length=args.stride_length,
         device=args.device or config.get("device", "auto"),
     )
-    if args.offline or config.get("offline", False):
-        os.environ["HF_HUB_OFFLINE"] = "1"
-        os.environ["TRANSFORMERS_OFFLINE"] = "1"
-    if args.stdout:
-        speech_pipeline, device, model_type = load_pipeline(model, options.device)
-        original, translated = transcribe_media(speech_pipeline, media[0].source, model_type, options)
-        selected = translated if args.translate else original
-        assert selected is not None
-        sys.stdout.write(render_output(formats[0], selected, media[0], model, device))
-        return 0
-    output_dir = Path(args.output_dir or config.get("output_dir", "transcripts")).expanduser().resolve()
-    progress = lambda message: print(message, file=sys.stderr)
-    summaries, failures = run_batch(media, model, output_dir, formats, options, args.overwrite, progress)
-    if args.summary_json:
-        json.dump({"files": summaries, "failures": failures}, sys.stdout, indent=2)
-        sys.stdout.write("\n")
-    elif failures:
-        print(f"Completed with {len(failures)} failure(s).", file=sys.stderr)
-    return 1 if failures else 0
+    with _offline_environment(args.offline or config.get("offline", False)):
+        runtime = load_pipeline(model, options.device)[0]
+        if args.stdout:
+            results = run_transcription_workflow(media, model, options, runtime=runtime)
+            result = results[0]
+            if result.status != "completed":
+                for diagnostic in result.diagnostics:
+                    print(f"{diagnostic.severity}: {diagnostic.message}", file=sys.stderr)
+                return 1
+            sys.stdout.write(render_output(formats[0], result, media[0], model, runtime.info.effective_device))
+            return 0
+        output_dir = Path(args.output_dir or config.get("output_dir", "transcripts")).expanduser().resolve()
+        progress = lambda message: print(message, file=sys.stderr)
+        summaries, failures = run_batch(media, model, output_dir, formats, options, args.overwrite, progress)
+        if args.summary_json:
+            json.dump(make_batch_result(summaries).to_dict(), sys.stdout, indent=2)
+            sys.stdout.write("\n")
+        incomplete = any(result.status != "completed" for result in summaries)
+        if not args.summary_json and failures:
+            print(f"Completed with {len(failures)} failure(s).", file=sys.stderr)
+        return 1 if incomplete else 0
 
 
 def command_models(args: argparse.Namespace) -> int:
@@ -253,6 +258,24 @@ def command_models(args: argparse.Namespace) -> int:
         print(f"Removed {removed.id}; reclaimed {_human_bytes(reclaimed)}")
         return 0
     raise MunError("Unknown models command")
+
+
+@contextlib.contextmanager
+def _offline_environment(enabled: bool):
+    if not enabled:
+        yield
+        return
+    previous = {key: os.environ.get(key) for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")}
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def command_config(args: argparse.Namespace) -> int:

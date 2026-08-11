@@ -12,6 +12,22 @@ from typing import Any, Callable, Iterable
 
 from .errors import MunError
 from .models import InstalledModel
+from . import __version__
+from .transcript import (
+    SCHEMA_VERSION,
+    Diagnostic,
+    Language,
+    SourceRecord,
+    TranscriptResult,
+    TranscriptSegment,
+    TranscriptVariant,
+    make_batch_result,
+    make_provenance,
+    render_json,
+    render_srt,
+    render_txt,
+    render_vtt,
+)
 
 MEDIA_EXTENSIONS = {
     ".aac", ".aiff", ".alac", ".avi", ".flac", ".m4a", ".mkv", ".mov", ".mp3",
@@ -100,41 +116,16 @@ def is_media(path: Path) -> bool:
 
 
 def load_pipeline(model: InstalledModel, requested_device: str = "auto") -> tuple[Any, str, str]:
-    try:
-        import torch
-        from transformers import AutoConfig, pipeline
+    from .runtime import create_transformers_runtime
 
-        device = detect_device(requested_device, torch)
-        config = AutoConfig.from_pretrained(model.path, local_files_only=True)
-        dtype = torch.float16 if device.startswith("cuda") else torch.float32
-        pipeline_device: str | int = device if device != "cpu" else -1
-        speech_pipeline = pipeline(
-            "automatic-speech-recognition",
-            model=model.path,
-            config=config,
-            device=pipeline_device,
-            dtype=dtype,
-            trust_remote_code=model.trust_remote_code,
-        )
-        return speech_pipeline, device, config.model_type
-    except Exception as exc:
-        raise MunError(f"Could not load {model.id}: {exc}") from exc
+    runtime = create_transformers_runtime(model, requested_device)
+    return runtime, runtime.info.effective_device, runtime.info.model_type
 
 
 def detect_device(requested: str, torch_module: Any) -> str:
-    if requested != "auto":
-        if requested.startswith("cuda") and not torch_module.cuda.is_available():
-            raise MunError("CUDA/ROCm was requested but is unavailable")
-        if requested == "mps" and not torch_module.backends.mps.is_available():
-            raise MunError("MPS was requested but is unavailable")
-        if requested not in {"cpu", "mps"} and not requested.startswith("cuda"):
-            raise MunError(f"Unknown device: {requested}")
-        return requested
-    if torch_module.cuda.is_available():
-        return "cuda:0"
-    if torch_module.backends.mps.is_available():
-        return "mps"
-    return "cpu"
+    from .runtime import detect_device as runtime_detect_device
+
+    return runtime_detect_device(requested, torch_module)
 
 
 def transcribe_media(
@@ -143,6 +134,8 @@ def transcribe_media(
     model_type: str,
     options: TranscriptionOptions,
 ) -> tuple[Transcript, Transcript | None]:
+    if hasattr(speech_pipeline, "transcribe"):
+        return speech_pipeline.transcribe(source, options)
     needs_timestamps = options.timestamps
     if needs_timestamps and model_type not in {"whisper", "wav2vec2", "hubert", "wavlm"}:
         raise MunError(f"The selected {model_type} model cannot provide timestamps")
@@ -166,9 +159,9 @@ def run_batch(
     options: TranscriptionOptions,
     overwrite: bool,
     progress: Callable[[str], None],
-) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
-    speech_pipeline, device, model_type = load_pipeline(model, options.device)
-    summaries: list[dict[str, Any]] = []
+) -> tuple[list[TranscriptResult], list[dict[str, str]]]:
+    runtime = load_pipeline(model, options.device)[0]
+    summaries: list[TranscriptResult] = []
     failures: list[dict[str, str]] = []
     used_bases: set[Path] = set()
     for index, item in enumerate(media, start=1):
@@ -176,17 +169,24 @@ def run_batch(
         expected = output_paths(base, formats, options.translate)
         if not overwrite and any(path.exists() for path in expected):
             progress(f"[{index}/{len(media)}] skipped {item.source} (output exists)")
-            summaries.append({"source": str(item.relative), "status": "skipped", "outputs": []})
+            summaries.append(TranscriptResult(
+                schema_version=SCHEMA_VERSION,
+                status="partial",
+                source=SourceRecord(item.source.name, str(item.relative)),
+                transcripts=[],
+                speakers=[],
+                diagnostics=[Diagnostic("warning", "output_exists", "Output already exists", "output", True)],
+                provenance=_provenance(runtime, model, options),
+            ))
             continue
-        progress(f"[{index}/{len(media)}] transcribing {item.source} ({device}, {model.id})")
+        progress(f"[{index}/{len(media)}] transcribing {item.source} ({runtime.info.effective_device}, {model.id})")
         try:
-            original, translated = transcribe_media(speech_pipeline, item.source, model_type, options)
-            written = write_outputs(
-                base, formats, item, model, device, original, translated, overwrite=overwrite
-            )
-            summaries.append(
-                {"source": str(item.relative), "status": "complete", "outputs": [str(path) for path in written]}
-            )
+            result = transcribe_source(runtime, item, model, options)
+            if result.status == "completed":
+                write_result_outputs(base, formats, result, options.translate, overwrite=overwrite)
+            summaries.append(result)
+            if result.status == "failed":
+                failures.append({"source": str(item.relative), "error": result.diagnostics[0].message if result.diagnostics else "failed"})
             progress(f"[{index}/{len(media)}] complete {item.source}")
         except KeyboardInterrupt:
             raise
@@ -194,6 +194,52 @@ def run_batch(
             failures.append({"source": str(item.relative), "error": str(exc)})
             progress(f"[{index}/{len(media)}] failed {item.source}: {exc}")
     return summaries, failures
+
+
+def transcribe_source(runtime: Any, media: SourceMedia, model: InstalledModel, options: TranscriptionOptions) -> TranscriptResult:
+    try:
+        original, translated = runtime.transcribe(media.source, options)
+        transcripts = [_variant("original", original, options.language, options.language is not None)]
+        if translated:
+            transcripts.append(_variant("english_translation", translated, "en", False))
+        return TranscriptResult(
+            schema_version=SCHEMA_VERSION,
+            status="completed",
+            source=SourceRecord(media.source.name, str(media.relative)),
+            transcripts=transcripts,
+            speakers=[],
+            diagnostics=[],
+            provenance=_provenance(runtime, model, options),
+        )
+    except Exception as exc:
+        return TranscriptResult(
+            schema_version=SCHEMA_VERSION,
+            status="failed",
+            source=SourceRecord(media.source.name, str(media.relative)),
+            transcripts=[],
+            speakers=[],
+            diagnostics=[Diagnostic("error", "transcription_failed", str(exc), "transcription", False)],
+            provenance=_provenance(runtime, model, options),
+        )
+
+
+def run_transcription_workflow(
+    media: list[SourceMedia],
+    model: InstalledModel,
+    options: TranscriptionOptions,
+    runtime: Any | None = None,
+    progress: Callable[[str], None] | None = None,
+) -> list[TranscriptResult]:
+    runtime = runtime or load_pipeline(model, options.device)[0]
+    results: list[TranscriptResult] = []
+    for index, item in enumerate(media, start=1):
+        if progress:
+            progress(f"[{index}/{len(media)}] transcribing {item.source} ({runtime.info.effective_device}, {model.id})")
+        result = transcribe_source(runtime, item, model, options)
+        results.append(result)
+        if progress:
+            progress(f"[{index}/{len(media)}] {result.status} {item.source}")
+    return results
 
 
 def output_base(output_dir: Path, media: SourceMedia, used: set[Path]) -> Path:
@@ -236,13 +282,52 @@ def write_outputs(
     return written
 
 
+def write_result_outputs(
+    base: Path,
+    formats: list[str],
+    result: TranscriptResult,
+    translated: bool,
+    overwrite: bool,
+) -> list[Path]:
+    labels = [("original", "original"), ("en", "english_translation")] if translated else [("", None)]
+    written: list[Path] = []
+    for label, kind in labels:
+        if kind and not any(variant.kind == kind for variant in result.transcripts):
+            continue
+        labelled_base = Path(f"{base}.{label}") if label else base
+        for format_name in formats:
+            path = Path(f"{labelled_base}.{format_name}")
+            if path.exists() and not overwrite:
+                raise MunError(f"Output already exists: {path}")
+            if kind:
+                from .transcript import select_variant
+                single = TranscriptResult(**{**result.__dict__, "transcripts": [select_variant(result, kind)]})
+            else:
+                single = result
+            _atomic_write(path, render_output(format_name, single, SourceMedia(Path(result.source.name), Path(result.source.relative_path)), InstalledModel(result.provenance.model.repository, result.provenance.model.revision or "", "", ""), result.provenance.effective_device))
+            written.append(path)
+    return written
+
+
 def render_output(
     format_name: str,
-    transcript: Transcript,
+    transcript: Transcript | TranscriptResult,
     media: SourceMedia,
     model: InstalledModel,
     device: str,
 ) -> str:
+    if isinstance(transcript, TranscriptResult):
+        try:
+            if format_name == "txt":
+                return render_txt(transcript)
+            if format_name == "json":
+                return render_json(transcript)
+            if format_name == "srt":
+                return render_srt(transcript)
+            if format_name == "vtt":
+                return render_vtt(transcript)
+        except ValueError as exc:
+            raise MunError(str(exc)) from exc
     if format_name == "txt":
         return transcript.text.strip() + "\n"
     if format_name == "json":
@@ -339,6 +424,43 @@ def _timestamp(seconds: float, format_name: str) -> str:
     whole_seconds, millis = divmod(remainder, 1000)
     separator = "," if format_name == "srt" else "."
     return f"{hours:02d}:{minutes:02d}:{whole_seconds:02d}{separator}{millis:03d}"
+
+
+def _variant(kind: str, transcript: Transcript, language: str | None, forced: bool) -> TranscriptVariant:
+    return TranscriptVariant(
+        kind=kind,  # type: ignore[arg-type]
+        language=Language(language or transcript.language, "forced" if forced else ("model" if kind == "english_translation" else "unknown")),
+        text=transcript.text,
+        segments=[
+            TranscriptSegment(
+                id=f"segment_{index}",
+                start_ms=_seconds_to_ms(segment.start),
+                end_ms=_seconds_to_ms(segment.end),
+                text=segment.text,
+                speaker_id=segment.speaker,
+                words=[],
+            )
+            for index, segment in enumerate(transcript.segments, start=1)
+        ],
+    )
+
+
+def _seconds_to_ms(seconds: float | None) -> int | None:
+    return None if seconds is None else round(seconds * 1000)
+
+
+def _provenance(runtime: Any, model: InstalledModel, options: TranscriptionOptions):
+    info = runtime.info
+    return make_provenance(
+        mun_version=__version__,
+        model_id=model.id,
+        revision=model.revision,
+        runtime_name=info.name,
+        runtime_version=info.version,
+        requested_device=options.device,
+        effective_device=info.effective_device,
+        precision=info.precision,
+    )
 
 
 def _atomic_write(path: Path, content: str) -> None:
