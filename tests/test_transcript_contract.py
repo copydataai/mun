@@ -345,6 +345,117 @@ class TranscriptContractTests(unittest.TestCase):
         self.assertTrue(any("] failed " in message for message in progress), progress)
         self.assertFalse(any("] complete " in message for message in progress), progress)
 
+    def test_serial_batch_cancellation_persists_completed_active_and_queued_outcomes(self) -> None:
+        runtime = self.runtime
+
+        class InterruptingRuntime:
+            info = runtime.info
+
+            def transcribe(self, source, options):
+                if source.name == "two.wav":
+                    raise KeyboardInterrupt
+                return runtime.transcribe(source, options)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            media = []
+            for name in ("one.wav", "two.wav", "three.wav"):
+                source = root / name
+                source.write_bytes(name.encode("ascii"))
+                media.append(SourceMedia(source, Path(name)))
+
+            with self.assertRaises(KeyboardInterrupt):
+                run_batch(
+                    media,
+                    self.model,
+                    root / "out",
+                    ["json"],
+                    TranscriptionOptions(),
+                    False,
+                    lambda _: None,
+                    runtime=InterruptingRuntime(),
+                )
+
+            receipt = json.loads((root / "out" / "mun-batch-interruption.json").read_text(encoding="utf-8"))
+            self.assertTrue((root / "out" / "one.json").is_file())
+
+        self.assertEqual(receipt["status"], "cancelled")
+        self.assertEqual([item["status"] for item in receipt["files"]], ["completed", "cancelled"])
+        self.assertEqual(receipt["counts"]["cancelled"], 1)
+        self.assertEqual(receipt["files"][1]["diagnostics"][0]["code"], "batch_cancelled")
+        self.assertEqual(receipt["files"][1]["source"]["relative_path"], "two.wav")
+        self.assertEqual(receipt["queued_unstarted_sources"], [{"name": "three.wav", "relative_path": "three.wav"}])
+        self.assertNotIn(temporary, json.dumps(receipt))
+
+    def test_parallel_batch_cancellation_flushes_completed_output_and_bounded_receipt(self) -> None:
+        completed_result = run_transcription_workflow(
+            [SourceMedia(Path("/private/one.wav"), Path("one.wav"))],
+            self.model,
+            TranscriptionOptions(device="cpu"),
+            runtime=self.runtime,
+        )[0]
+
+        class Future:
+            def __init__(self, index):
+                self.index = index
+
+            def result(self):
+                return self.index, completed_result
+
+            def cancel(self):
+                return True
+
+        class Executor:
+            def __init__(self, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def submit(self, function, payload):
+                return Future(payload[0])
+
+            def shutdown(self, wait=True, cancel_futures=False):
+                pass
+
+        def interrupted_completion(futures):
+            ordered = list(futures)
+            yield ordered[0]
+            raise KeyboardInterrupt
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            media = []
+            for name, size in (("one.wav", 30), ("two.wav", 20), ("three.wav", 10)):
+                source = root / name
+                source.write_bytes(b"x" * size)
+                media.append(SourceMedia(source, Path(name)))
+
+            with patch("mun.core.ProcessPoolExecutor", Executor), patch(
+                "mun.core.as_completed", interrupted_completion
+            ), self.assertRaises(KeyboardInterrupt):
+                run_batch(
+                    media,
+                    self.model,
+                    root / "out",
+                    ["json"],
+                    TranscriptionOptions(device="cpu"),
+                    False,
+                    lambda _: None,
+                    jobs=2,
+                )
+
+            receipt = json.loads((root / "out" / "mun-batch-interruption.json").read_text(encoding="utf-8"))
+            self.assertTrue((root / "out" / "one.json").is_file())
+
+        self.assertEqual([item["status"] for item in receipt["files"]], ["completed", "cancelled"])
+        self.assertEqual(receipt["counts"]["cancelled"], 1)
+        self.assertEqual(receipt["files"][1]["source"]["relative_path"], "two.wav")
+        self.assertEqual(receipt["queued_unstarted_sources"], [{"name": "three.wav", "relative_path": "three.wav"}])
+
     def test_unrelated_txt_blocks_without_fabricating_transcript_content(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary) / "file.wav"

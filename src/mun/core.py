@@ -31,6 +31,7 @@ from .transcript import (
     TranscriptResult,
     TranscriptSegment,
     TranscriptVariant,
+    make_batch_result,
     make_provenance,
     make_trust,
     render_json,
@@ -56,6 +57,7 @@ class MediaProbe:
 _FFPROBE_CACHE: dict[Path, MediaProbe] = {}
 _BINARY_PATH_CACHE: dict[str, str | None] = {}
 SOURCE_HASH_POLICY = "sha256_source_bytes"
+BATCH_INTERRUPTION_FILE = "mun-batch-interruption.json"
 
 
 class ExportCommitError(MunError):
@@ -146,6 +148,54 @@ def _sha256_file(path: Path) -> str | None:
 
 def _source_record(media: SourceMedia, sha256: str | None = None) -> SourceRecord:
     return SourceRecord(media.source.name, str(media.relative), sha256=sha256 if sha256 is not None else _sha256_file(media.source))
+
+
+def _cancelled_result(
+    media: SourceMedia,
+    model: InstalledModel,
+    options: TranscriptionOptions,
+    runtime: Any,
+    reuse_status: ReuseStatus,
+) -> TranscriptResult:
+    source_sha256 = _sha256_file(media.source)
+    return TranscriptResult(
+        schema_version=SCHEMA_VERSION,
+        status="cancelled",
+        source=_source_record(media, source_sha256),
+        transcripts=[],
+        speakers=[],
+        diagnostics=[Diagnostic("warning", "batch_cancelled", "Batch transcription was cancelled", "transcription", True)],
+        provenance=_provenance(runtime, model, options),
+        operation=_operation(runtime, options, source_sha256),
+        reuse_status=reuse_status,
+        trust=make_trust(model.trust_remote_code),
+    )
+
+
+def _persist_batch_interruption(
+    output_dir: Path,
+    results: list[TranscriptResult],
+    queued_unstarted: list[SourceMedia],
+) -> None:
+    payload = {
+        **make_batch_result(results).to_dict(),
+        "status": "cancelled",
+        "queued_unstarted_sources": [
+            {"name": item.source.name, "relative_path": str(item.relative)} for item in queued_unstarted
+        ],
+    }
+    output_dir.mkdir(parents=True, exist_ok=True)
+    destination = output_dir / BATCH_INTERRUPTION_FILE
+    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _operation(runtime: Any, options: TranscriptionOptions, source_sha256: str | None) -> OperationRecord:
@@ -534,7 +584,7 @@ def run_batch(
         fallback_runtime = runtime
 
     if jobs == 1:
-        for index, item, base in queued:
+        for queued_position, (index, item, base) in enumerate(queued):
             progress(f"[{index}/{len(media)}] transcribing {item.source} ({effective_device}, {model.id})")
             try:
                 result = transcribe_source(runtime, item, model, options)
@@ -544,6 +594,15 @@ def run_batch(
                 queued_results[index] = result
                 progress(f"[{index}/{len(media)}] {result.status} {item.source}")
             except KeyboardInterrupt:
+                queued_results[index] = _cancelled_result(
+                    item, model, options, runtime, queued_status[index]
+                )
+                interruption_results = [queued_results[key] for key in sorted(queued_results)]
+                _persist_batch_interruption(
+                    output_dir,
+                    interruption_results,
+                    [entry[1] for entry in queued[queued_position + 1:]],
+                )
                 raise
             except ExportCommitError:
                 queued_results[index] = TranscriptResult(
@@ -587,10 +646,11 @@ def run_batch(
     base_by_index = {index: base for index, _, base in queued}
     media_by_index = {index: item for index, item, _ in queued}
 
-    with ProcessPoolExecutor(max_workers=jobs, initializer=_init_batch_worker, initargs=(model, options)) as executor:
-        futures = {
-            executor.submit(_run_batch_worker, (index, item)): index for index, item, _ in queued
-        }
+    executor = ProcessPoolExecutor(max_workers=jobs, initializer=_init_batch_worker, initargs=(model, options))
+    futures: dict[Any, int] = {}
+    try:
+        for index, item, _ in queued:
+            futures[executor.submit(_run_batch_worker, (index, item))] = index
         for future in as_completed(futures):
             index = futures[future]
             item = media_by_index[index]
@@ -613,6 +673,43 @@ def run_batch(
                 )
 
             completed[index] = result
+    except KeyboardInterrupt:
+        for future in futures:
+            future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+
+        for index in sorted(completed):
+            result = completed[index]
+            base = base_by_index[index]
+            if result.status == "completed":
+                try:
+                    write_result_outputs(base, formats, result, options.translate, overwrite=overwrite)
+                except ExportCommitError:
+                    result = replace(
+                        result,
+                        status="partial",
+                        transcripts=[],
+                        diagnostics=[Diagnostic("error", "partial_commit", "Export commit was only partially completed", "export", False)],
+                    )
+            queued_results[index] = result
+
+        unfinished = [(index, item) for index, item, _ in queued if index not in completed]
+        queued_unstarted: list[SourceMedia] = []
+        if unfinished:
+            active_index, active_media = unfinished[0]
+            queued_results[active_index] = _cancelled_result(
+                active_media, model, options, fallback_runtime, queued_status[active_index]
+            )
+            queued_unstarted = [item for _, item in unfinished[1:]]
+
+        _persist_batch_interruption(
+            output_dir,
+            [queued_results[index] for index in sorted(queued_results)],
+            queued_unstarted,
+        )
+        raise
+    else:
+        executor.shutdown(wait=True)
 
     ordered = sorted(completed)
     for index in ordered:
