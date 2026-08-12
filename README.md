@@ -180,6 +180,11 @@ Mun stores only public key material and a fingerprint in the envelope. This
 authenticates bytes and a producer-declared role, not accuracy, identity,
 consent, authorization, or custody.
 
+Interrupted operations use an atomically updated, versioned journal. Inspect or
+resume one idempotently with `mun resume path/to/batch.journal.json`. Each source
+is classified as verified-complete, safely-resumable, must-recompute, conflict,
+or indeterminate. Partial or unverifiable projections are never silently reused.
+
 ### Understand deletion receipts
 
 Model removal prints a receipt with the exact managed path attempted, the app-visible result, and estimated bytes removed. Transient download cleanup uses the same scoped receipt contract. Receipts do not claim universal erasure. They explicitly exclude backups, APFS snapshots, swap, filesystem remnants, transcript exports, and third-party caches. Mun refuses deletion requests outside its managed model directory.

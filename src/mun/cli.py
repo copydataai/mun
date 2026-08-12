@@ -17,6 +17,7 @@ from . import __version__
 from .acceptance import create_acceptance
 from .artifacts import canonical_json_bytes
 from .authentication import sign_artifact, verify_artifact
+from .journal import resume_journal
 from .config import config_path, load_config, reset_config, set_config
 from .core import (
     TranscriptionOptions,
@@ -151,6 +152,9 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("receipt", type=Path)
     verify.add_argument("envelope", type=Path)
 
+    resume = subcommands.add_parser("resume", help="classify and safely resume an interrupted batch journal")
+    resume.add_argument("journal", type=Path)
+
     doctor = subcommands.add_parser("doctor", help="diagnose the local runtime")
     doctor.add_argument("--json", action="store_true")
     return parser
@@ -191,6 +195,9 @@ def main(argv: list[str] | None = None) -> int:
             receipt = json.loads(args.receipt.read_text(encoding="utf-8"))
             envelope = json.loads(args.envelope.read_text(encoding="utf-8"))
             print(json.dumps(verify_artifact(artifact, receipt, envelope), sort_keys=True))
+            return 0
+        if args.command == "resume":
+            print(json.dumps(resume_journal(args.journal), sort_keys=True))
             return 0
         if args.command == "doctor":
             return command_doctor(args)
