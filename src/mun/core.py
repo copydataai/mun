@@ -1097,13 +1097,7 @@ def write_result_outputs(
         _atomic_write(receipt_path, receipt.to_json())
 
     resumable = resume_artifacts or {}
-    existing = [
-        path for path in destinations
-        if path.exists() and resumable.get(str(path)) != _sha256_file(path)
-    ]
-    if existing and not overwrite:
-        persist_receipt("failed_before_commit")
-        raise MunError(f"Output already exists: {existing[0]}")
+    resuming = resume_artifacts is not None
 
     base.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=".mun-stage-", dir=base.parent))
@@ -1127,6 +1121,23 @@ def write_result_outputs(
                 TranscriptResult.from_json(staged_path.read_text(encoding="utf-8"))
             artifacts.append(ExportArtifact(str(destination), digest, staged_path.stat().st_size))
             staged.append((staged_path, destination))
+
+        expected_digests = {artifact.path: artifact.sha256 for artifact in artifacts}
+        conflicting = []
+        for destination in destinations:
+            if not destination.exists():
+                continue
+            expected_digest = expected_digests[str(destination)]
+            verified_resume = (
+                resuming
+                and resumable.get(str(destination)) == expected_digest
+                and _sha256_file(destination) == expected_digest
+            )
+            if not verified_resume and (resuming or not overwrite):
+                conflicting.append(destination)
+        if conflicting:
+            persist_receipt("failed_before_commit")
+            raise MunError(f"Output already exists or cannot be verified: {conflicting[0]}")
 
         if transition:
             transition("render_staged", {

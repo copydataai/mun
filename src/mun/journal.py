@@ -188,24 +188,44 @@ def resume_batch_journal(
             journal.transition(row["source_sha256"], "failed", evidence={"result": result.to_dict()})
             continue
 
-        resumable = {
+        committed = evidence.get("committed", [])
+        artifacts = evidence.get("artifacts", [])
+        if outcome["state"] == "partial_commit" and (
+            not isinstance(committed, list)
+            or not committed
+            or not isinstance(artifacts, list)
+        ):
+            raise JournalError("Partial commit evidence cannot verify committed projections")
+        artifact_digests = {
             artifact["path"]: artifact["sha256"]
-            for artifact in evidence.get("artifacts", [])
-            if isinstance(artifact, Mapping) and isinstance(artifact.get("path"), str) and isinstance(artifact.get("sha256"), str)
+            for artifact in artifacts
+            if isinstance(artifact, Mapping)
+            and isinstance(artifact.get("path"), str)
+            and isinstance(artifact.get("sha256"), str)
         }
+        resumable = {
+            committed_path: artifact_digests[committed_path]
+            for committed_path in committed
+            if isinstance(committed_path, str) and committed_path in artifact_digests
+        }
+        if outcome["state"] == "partial_commit" and len(resumable) != len(committed):
+            raise JournalError("Partial commit evidence cannot verify committed projections")
 
         def transition(state: str, update: dict[str, Any]) -> None:
             journal.transition(row["source_sha256"], state, evidence=update)
 
-        write_result_outputs(
-            base,
-            formats,
-            result,
-            options.translate,
-            overwrite=bool(binding.get("overwrite")),
-            transition=transition,
-            resume_artifacts=resumable,
-        )
+        try:
+            write_result_outputs(
+                base,
+                formats,
+                result,
+                options.translate,
+                overwrite=bool(binding.get("overwrite")),
+                transition=transition,
+                resume_artifacts=resumable,
+            )
+        except MunError as exc:
+            raise JournalError("Resumed projections conflict with the journal-bound result") from exc
         journal.transition(row["source_sha256"], "committed", evidence={"verified": True})
 
     return {"schema_version": 1, "journal": path.name, "sources": journal.classify(), "idempotent": True}

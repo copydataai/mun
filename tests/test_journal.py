@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from hashlib import sha256
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,6 +14,79 @@ from mun.runtime import FakeSpeechRuntime
 
 
 class JournalTests(unittest.TestCase):
+    def _partial_commit(self, root: Path):
+        class ProcessDeath(BaseException):
+            pass
+
+        model = InstalledModel("example/model", "abc123", "/models/example", "2026-08-09T00:00:00Z")
+        source = root / "source.wav"
+        source.write_bytes(b"journal source")
+        runtime = FakeSpeechRuntime(Transcript("Recovered", [Segment("Recovered", 0.0, 1.0)], "en"))
+        runtime.model_artifact_sha256 = "a" * 64
+        runtime.test_installed_model = model
+
+        def kill_at_partial_commit(name: str) -> None:
+            if name == "partial_commit":
+                raise ProcessDeath
+
+        with self.assertRaises(ProcessDeath):
+            run_batch(
+                [SourceMedia(source, Path("source.wav"))], model, root / "out", ["json", "txt"],
+                TranscriptionOptions(), False, lambda _: None, runtime=runtime,
+                fault_injector=kill_at_partial_commit,
+            )
+        return root / "out" / "mun-batch.journal.json", runtime
+
+    def test_partial_commit_resume_preserves_verified_projection_writes_missing_remainder_and_repeats(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            journal_path, runtime = self._partial_commit(root)
+            json_path = root / "out" / "source.json"
+            txt_path = root / "out" / "source.txt"
+            committed = json_path.read_bytes()
+
+            first = resume_batch_journal(journal_path, runtime_loader=lambda _model, _device: runtime)
+            second = resume_batch_journal(journal_path, runtime_loader=lambda _model, _device: runtime)
+
+            self.assertEqual(json_path.read_bytes(), committed)
+            self.assertEqual(txt_path.read_text(encoding="utf-8"), "Recovered\n")
+            self.assertEqual(first, second)
+            self.assertEqual(first["sources"][0]["classification"], "verified-complete")
+
+    def test_partial_commit_resume_rejects_conflicting_committed_projection_without_writing_remainder(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            journal_path, runtime = self._partial_commit(root)
+            json_path = root / "out" / "source.json"
+            txt_path = root / "out" / "source.txt"
+            conflicting = b'{"unrelated": true}\n'
+            json_path.write_bytes(conflicting)
+            payload = json.loads(journal_path.read_text(encoding="utf-8"))
+            payload["sources"][0]["evidence"]["artifacts"][0]["sha256"] = sha256(conflicting).hexdigest()
+            journal_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            with self.assertRaises(JournalError):
+                resume_batch_journal(journal_path, runtime_loader=lambda _model, _device: runtime)
+
+            self.assertEqual(json_path.read_bytes(), conflicting)
+            self.assertFalse(txt_path.exists())
+
+    def test_partial_commit_resume_rejects_unverifiable_committed_projection_without_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            journal_path, runtime = self._partial_commit(root)
+            payload = json.loads(journal_path.read_text(encoding="utf-8"))
+            payload["sources"][0]["evidence"].pop("artifacts")
+            journal_path.write_text(json.dumps(payload), encoding="utf-8")
+            json_path = root / "out" / "source.json"
+            committed = json_path.read_bytes()
+
+            with self.assertRaises(JournalError):
+                resume_batch_journal(journal_path, runtime_loader=lambda _model, _device: runtime)
+
+            self.assertEqual(json_path.read_bytes(), committed)
+            self.assertFalse((root / "out" / "source.txt").exists())
+
     def test_public_batch_recovers_from_every_durable_boundary_and_repeated_resume(self) -> None:
         class ProcessDeath(BaseException):
             pass
