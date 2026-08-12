@@ -60,14 +60,28 @@ def create_acceptance(
             raise AcceptanceError("Corrected decisions require replacement text")
         decisions[key] = decision
 
-    waivers: dict[tuple[str | None, str], Mapping[str, Any]] = {}
-    for waiver in policy.get("waivers", []):
-        if not isinstance(waiver, Mapping) or not str(waiver.get("reason", "")).strip():
-            raise AcceptanceError("Every waiver requires a bounded segment and reason")
-        key = (str(waiver["transcript_kind"]) if waiver.get("transcript_kind") else None, str(waiver.get("segment_id")))
+    waiver_rows = policy.get("waivers", [])
+    if not isinstance(waiver_rows, list):
+        raise AcceptanceError("Policy waivers must be a list")
+    waivers: dict[tuple[str, str], dict[str, str]] = {}
+    for waiver in waiver_rows:
+        if not isinstance(waiver, Mapping):
+            raise AcceptanceError("Every waiver requires one exact transcript variant segment and reason")
+        kind = waiver.get("transcript_kind")
+        segment_id = waiver.get("segment_id")
+        reason = waiver.get("reason")
+        if (
+            kind not in {"original", "english_translation"}
+            or not isinstance(segment_id, str) or not segment_id
+            or not isinstance(reason, str) or not reason.strip()
+        ):
+            raise AcceptanceError("Every waiver requires one exact transcript variant segment and reason")
+        key = (kind, segment_id)
+        if key not in indexed:
+            raise AcceptanceError("Waiver targets an absent or cross-variant segment")
         if key in waivers:
             raise AcceptanceError("Duplicate waiver")
-        waivers[key] = waiver
+        waivers[key] = {"transcript_kind": kind, "segment_id": segment_id, "reason": reason.strip()}
 
     segment_rows = []
     blocked = []
@@ -76,7 +90,7 @@ def create_acceptance(
         key = (kind, segment.id)
         decision = decisions.get(key, {"disposition": "unreviewed"})
         disposition = str(decision["disposition"])
-        waiver = waivers.get(key) or waivers.get((None, segment.id))
+        waiver = waivers.get(key)
         if disposition in {"unreviewed", "exception"}:
             if waiver is None:
                 blocked.append((disposition, segment.id))
@@ -96,6 +110,13 @@ def create_acceptance(
         state, segment_id = blocked[0]
         phrase = "unresolved exception" if state == "exception" else "unreviewed segment"
         raise AcceptanceError(f"Final acceptance blocked by {phrase}: {segment_id}")
+    if len(used_waivers) != len(waivers):
+        raise AcceptanceError("Waiver does not target an unresolved segment disposition")
+
+    canonical_policy = dict(policy)
+    canonical_policy["waivers"] = sorted(waivers.values(), key=lambda waiver: (
+        waiver["transcript_kind"], waiver["segment_id"], waiver["reason"]
+    ))
 
     projection_rows = [
         {"name": name, "sha256": sha256(value).hexdigest(), "size_bytes": len(value)}
@@ -108,7 +129,7 @@ def create_acceptance(
         "source_sha256": machine.source.sha256,
         "machine_result_digest": machine.result_digest,
         "overlay_sha256": sha256(canonical_json_bytes(overlay)).hexdigest(),
-        "policy": dict(policy),
+        "policy": canonical_policy,
         "segments": segment_rows,
         "waivers": used_waivers,
         "trust": machine.to_dict()["trust"],
@@ -122,7 +143,7 @@ def create_acceptance(
         "source_sha256": machine.source.sha256,
         "machine_result_digest": machine.result_digest,
         "overlay_sha256": artifact["overlay_sha256"],
-        "policy_sha256": sha256(canonical_json_bytes(policy)).hexdigest(),
+        "policy_sha256": sha256(canonical_json_bytes(canonical_policy)).hexdigest(),
         "artifact_sha256": sha256(canonical_json_bytes(artifact)).hexdigest(),
         "projections": projection_rows,
     }
