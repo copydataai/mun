@@ -23,7 +23,8 @@ from mun.core import (
 )
 from mun.models import InstalledModel
 from mun.runtime import FakeSpeechRuntime
-from mun.transcript import make_batch_result
+from mun.artifacts import ArtifactValidationError
+from mun.transcript import TranscriptResult, make_batch_result
 
 
 class TranscriptContractTests(unittest.TestCase):
@@ -48,6 +49,25 @@ class TranscriptContractTests(unittest.TestCase):
         self.assertEqual(payload["provenance"]["runtime"]["name"], "test")
         self.assertEqual(payload["source"]["sha256"], hashlib.sha256(b"canonical source bytes").hexdigest())
         self.assertIn("precision", payload["provenance"])
+        self.assertRegex(payload["result_digest"], r"^[0-9a-f]{64}$")
+
+    def test_json_loader_validates_claimed_result_digest(self) -> None:
+        result = run_transcription_workflow([self.media], self.model, TranscriptionOptions(), runtime=self.runtime)[0]
+        payload = json.loads(result.to_json())
+        payload["transcripts"][0]["text"] = "tampered"
+
+        with self.assertRaises(ArtifactValidationError):
+            TranscriptResult.from_json(json.dumps(payload))
+
+    def test_json_loader_accepts_legacy_result_without_digest(self) -> None:
+        result = run_transcription_workflow([self.media], self.model, TranscriptionOptions(), runtime=self.runtime)[0]
+        payload = result.to_dict()
+        payload.pop("result_digest")
+
+        loaded = TranscriptResult.from_json(json.dumps(payload))
+
+        self.assertIsNone(loaded.result_digest)
+        self.assertEqual(loaded.transcripts[0].text, "Hello world")
 
     def test_source_digest_depends_on_bytes_not_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -92,8 +112,14 @@ class TranscriptContractTests(unittest.TestCase):
 
         self.assertEqual(render_output("txt", result, self.media, self.model, "cpu"), "Hello world\n")
         self.assertIn('"transcripts"', render_output("json", result, self.media, self.model, "cpu"))
-        self.assertIn("00:00:00,000 --> 00:00:01,250", render_output("srt", result, self.media, self.model, "cpu"))
-        self.assertTrue(render_output("vtt", result, self.media, self.model, "cpu").startswith("WEBVTT\n"))
+        self.assertEqual(
+            render_output("srt", result, self.media, self.model, "cpu"),
+            "1\n00:00:00,000 --> 00:00:01,250\nHello\n",
+        )
+        self.assertEqual(
+            render_output("vtt", result, self.media, self.model, "cpu"),
+            "WEBVTT\n\n00:00:00.000 --> 00:00:01.250\nHello\n",
+        )
 
     def test_batch_result_contains_ordered_records_and_counts(self) -> None:
         results = run_transcription_workflow([self.media, SourceMedia(Path("/x/second.wav"), Path("second.wav"))], self.model, TranscriptionOptions(), runtime=self.runtime)

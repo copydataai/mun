@@ -5,7 +5,9 @@ import platform
 import sys
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Any, Literal
+
+from .artifacts import machine_result_digest, validate_machine_result
 
 SCHEMA_VERSION = 1
 Status = Literal["completed", "partial", "failed", "cancelled"]
@@ -148,12 +150,28 @@ class TranscriptResult:
     provenance: Provenance
     operation: OperationRecord | None = None
     overlap_ms: int = 0
+    result_digest: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.result_digest is None:
+            object.__setattr__(self, "result_digest", machine_result_digest(self))
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), ensure_ascii=False, indent=2) + "\n"
+
+    @classmethod
+    def from_json(cls, value: str) -> TranscriptResult:
+        payload = json.loads(value)
+        if not isinstance(payload, dict):
+            raise TypeError("Transcript result JSON must contain an object")
+        validate_machine_result(payload)
+        result = _transcript_result_from_dict(payload)
+        if "result_digest" not in payload:
+            object.__setattr__(result, "result_digest", None)
+        return result
 
 
 @dataclass(frozen=True)
@@ -173,11 +191,11 @@ def make_batch_result(files: list[TranscriptResult]) -> BatchResult:
     return BatchResult(SCHEMA_VERSION, files, counts)
 
 
-def make_provenance(*, mun_version: str, model_id: str, revision: str | None, runtime_name: str, runtime_version: str | None, requested_device: str, effective_device: str, precision: str | None) -> Provenance:
+def make_provenance(*, mun_version: str, model_id: str, revision: str | None, artifact_sha256: str | None = None, runtime_name: str, runtime_version: str | None, requested_device: str, effective_device: str, precision: str | None) -> Provenance:
     return Provenance(
         mun_version=mun_version,
         created_at=datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-        model=ModelProvenance(model_id, revision),
+        model=ModelProvenance(model_id, revision, artifact_sha256),
         runtime=RuntimeProvenance(
             runtime_name,
             runtime_version,
@@ -191,6 +209,78 @@ def make_provenance(*, mun_version: str, model_id: str, revision: str | None, ru
         requested_device=requested_device,
         effective_device=effective_device,
         precision=precision,
+    )
+
+
+def _transcript_result_from_dict(payload: dict[str, Any]) -> TranscriptResult:
+    source = payload["source"]
+    provenance = payload["provenance"]
+    model = provenance["model"]
+    runtime = provenance["runtime"]
+    environment = runtime.get("environment")
+    operation = payload.get("operation")
+    return TranscriptResult(
+        schema_version=payload["schema_version"],
+        status=payload["status"],
+        source=SourceRecord(
+            source["name"], source["relative_path"], source.get("duration_ms"), source.get("sha256")
+        ),
+        transcripts=[_transcript_variant_from_dict(item) for item in payload["transcripts"]],
+        speakers=[Speaker(**item) for item in payload["speakers"]],
+        diagnostics=[Diagnostic(**item) for item in payload["diagnostics"]],
+        provenance=Provenance(
+            mun_version=provenance["mun_version"],
+            created_at=provenance["created_at"],
+            model=ModelProvenance(model["repository"], model.get("revision"), model.get("artifact_sha256")),
+            runtime=RuntimeProvenance(
+                runtime["name"],
+                runtime.get("version"),
+                RuntimeEnvironment(**environment) if environment is not None else None,
+            ),
+            requested_device=provenance["requested_device"],
+            effective_device=provenance["effective_device"],
+            precision=provenance.get("precision"),
+        ),
+        operation=_operation_from_dict(operation) if operation is not None else None,
+        overlap_ms=payload.get("overlap_ms", 0),
+        result_digest=payload.get("result_digest"),
+    )
+
+
+def _transcript_variant_from_dict(payload: dict[str, Any]) -> TranscriptVariant:
+    language = payload["language"]
+    return TranscriptVariant(
+        kind=payload["kind"],
+        language=Language(language.get("tag"), language.get("source", "unknown"), language.get("confidence")),
+        text=payload["text"],
+        segments=[
+            TranscriptSegment(
+                id=segment["id"],
+                start_ms=segment.get("start_ms"),
+                end_ms=segment.get("end_ms"),
+                text=segment["text"],
+                speaker_id=segment.get("speaker_id"),
+                words=[Word(**word) for word in segment["words"]] if segment.get("words") is not None else None,
+            )
+            for segment in payload["segments"]
+        ],
+    )
+
+
+def _operation_from_dict(payload: dict[str, Any]) -> OperationRecord:
+    prepared = payload["prepared_media"]
+    converter = prepared.get("converter")
+    return OperationRecord(
+        parameters=OperationParameters(**payload["parameters"]),
+        prepared_media=PreparedMediaRecord(
+            used=prepared["used"],
+            sha256=prepared.get("sha256"),
+            media_format=prepared.get("media_format"),
+            sample_rate_hz=prepared.get("sample_rate_hz"),
+            channels=prepared.get("channels"),
+            converter=ConverterIdentity(**converter) if converter is not None else None,
+        ),
+        source_hash_policy=payload["source_hash_policy"],
     )
 
 

@@ -757,6 +757,7 @@ def _provenance(runtime: Any, model: InstalledModel, options: TranscriptionOptio
         mun_version=__version__,
         model_id=model.id,
         revision=model.revision,
+        artifact_sha256=getattr(runtime, "model_artifact_sha256", None),
         runtime_name=info.name,
         runtime_version=info.version,
         requested_device=options.device,

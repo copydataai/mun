@@ -38,6 +38,7 @@ class TransformersRuntime:
             raise MunError(
                 f"Model integrity verification failed: {verification.status}{detail}. {verification.guidance}".strip()
             )
+        self.model_artifact_sha256 = verification.artifact_digest
         try:
             import torch
             from transformers import AutoConfig, pipeline

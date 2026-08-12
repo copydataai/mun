@@ -12,6 +12,7 @@ invented values.
 ```json
 {
   "schema_version": 1,
+  "result_digest": "sha256-of-the-canonical-identity-bytes",
   "status": "completed",
   "source": {
     "name": "interview.wav",
@@ -125,6 +126,30 @@ Python version and implementation, operating-system identifier, and machine
 architecture. They do not contain usernames, home directories, environment
 variables, hostnames, absolute paths, or secrets.
 
+## Machine result identity
+
+`result_digest` is the SHA-256 digest of canonical UTF-8 JSON bytes for the
+machine result. Canonicalization sorts object keys, uses compact JSON syntax,
+and normalizes CRLF and CR string newlines to LF. Array order remains
+significant. The canonical identity excludes the `result_digest` claim itself
+and observational receipt fields named `created_at`.
+
+The identity therefore covers source identity, the exact prepared input,
+model repository, revision and verified artifact-manifest digest, runtime and
+stable environment facts, inference parameters, every transcript variant,
+speakers, status, overlap, and diagnostics. Changing any of those facts changes
+the digest. Equivalent results recorded at different creation times retain the
+same digest.
+
+Readers may continue to accept legacy schema-version-1 records without a
+`result_digest`. When a digest is present, loaders must recompute it and reject
+a mismatch as a typed validation failure. Additive unknown fields participate
+in identity and remain compatible with the schema rule below.
+
+Result identity proves only that a claimed record is consistent with its
+recorded derivation inputs and outputs. It does not prove recognition
+correctness, semantic accuracy, authenticity, or truth.
+
 ## Invariants
 
 - Status is `completed`, `partial`, `failed`, or `cancelled`. `partial` means at
@@ -148,7 +173,8 @@ variables, hostnames, absolute paths, or secrets.
   secret, username, home path, or absolute source path by default.
 - Provenance identifies the exact model revision, derived artifact when used,
   runtime, requested and effective device, precision, Mun version, and creation
-  time. Unavailable values remain `null`.
+  time. Unavailable values remain `null`. Creation time is observational and
+  does not participate in result identity.
 - SHA-256 digests establish byte identity only. They do not establish
   authenticity, consent, custody or continuity, or semantic correctness.
 
