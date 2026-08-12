@@ -99,7 +99,9 @@ class OperationJournal:
         temporary = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
         try:
             with temporary.open("wb") as stream:
-                stream.write(canonical_json_bytes(self.payload) + b"\n")
+                stream.write(json.dumps(
+                    self.payload, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8") + b"\n")
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, self.path)
@@ -118,3 +120,103 @@ def resume_journal(
                 result = runner(deepcopy(row["binding"]), outcome["classification"])
                 journal.transition(row["source_sha256"], str(result["state"]), evidence=result.get("evidence", {}))
     return {"schema_version": 1, "journal": path.name, "sources": journal.classify(), "idempotent": True}
+
+
+def resume_batch_journal(
+    path: Path,
+    runtime_loader: Callable[[Any, str], Any] | None = None,
+) -> dict[str, Any]:
+    from .core import SourceMedia, TranscriptionOptions, transcribe_source, write_result_outputs
+    from .models import InstalledModel
+    from .runtime import create_transformers_runtime
+    from .transcript import TranscriptResult
+
+    journal = OperationJournal.load(path)
+    for row, outcome in zip(journal.payload["sources"], journal.classify()):
+        if outcome["classification"] == "verified-complete":
+            continue
+        if outcome["classification"] == "indeterminate":
+            raise JournalError("Journal binding is indeterminate")
+
+        binding = deepcopy(row["binding"])
+        if binding.get("resumable") is not True:
+            raise JournalError("Journal source lacks an exact resumable binding")
+        source = Path(str(binding.get("source_path", "")))
+        if not source.is_file() or _sha256_path(source) != binding.get("source_sha256"):
+            raise JournalError("Source media no longer matches the journal binding")
+        try:
+            model = InstalledModel(**binding["model"])
+            options = TranscriptionOptions(**binding["options"])
+            formats = list(binding["formats"])
+            base = Path(binding["base"])
+            expected_runtime = binding["runtime"]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise JournalError("Journal binding is malformed") from exc
+
+        loader = runtime_loader or (lambda installed, device: create_transformers_runtime(installed, device))
+        runtime = loader(model, options.device)
+        observed_runtime = {
+            "name": runtime.info.name,
+            "version": runtime.info.version,
+            "requested_device": runtime.info.requested_device,
+            "effective_device": runtime.info.effective_device,
+            "precision": runtime.info.precision,
+            "model_artifact_sha256": getattr(runtime, "model_artifact_sha256", None),
+        }
+        if observed_runtime != expected_runtime:
+            raise JournalError("Runtime and model artifact no longer match the journal binding")
+
+        evidence = outcome.get("evidence", {})
+        result_payload = evidence.get("result")
+        if outcome["state"] in {"prepared", "inference_started"} or not isinstance(result_payload, Mapping):
+            journal.transition(row["source_sha256"], "inference_started")
+            result = transcribe_source(
+                runtime,
+                SourceMedia(source, Path(binding["relative_path"])),
+                model,
+                options,
+            )
+            journal.transition(
+                row["source_sha256"],
+                "inference_completed",
+                evidence={"result": result.to_dict(), "result_digest": result.result_digest},
+            )
+        else:
+            result = TranscriptResult.from_json(json.dumps(result_payload))
+
+        if result.status != "completed":
+            journal.transition(row["source_sha256"], "failed", evidence={"result": result.to_dict()})
+            continue
+
+        resumable = {
+            artifact["path"]: artifact["sha256"]
+            for artifact in evidence.get("artifacts", [])
+            if isinstance(artifact, Mapping) and isinstance(artifact.get("path"), str) and isinstance(artifact.get("sha256"), str)
+        }
+
+        def transition(state: str, update: dict[str, Any]) -> None:
+            journal.transition(row["source_sha256"], state, evidence=update)
+
+        write_result_outputs(
+            base,
+            formats,
+            result,
+            options.translate,
+            overwrite=bool(binding.get("overwrite")),
+            transition=transition,
+            resume_artifacts=resumable,
+        )
+        journal.transition(row["source_sha256"], "committed", evidence={"verified": True})
+
+    return {"schema_version": 1, "journal": path.name, "sources": journal.classify(), "idempotent": True}
+
+
+def _sha256_path(path: Path) -> str | None:
+    try:
+        digest = sha256()
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+    except OSError:
+        return None

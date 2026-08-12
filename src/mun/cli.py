@@ -17,7 +17,7 @@ from . import __version__
 from .acceptance import create_acceptance
 from .artifacts import canonical_json_bytes
 from .authentication import sign_artifact, verify_artifact
-from .journal import resume_journal
+from .journal import resume_batch_journal
 from .quality import DeterministicFixtureRuntime, run_quality_qualification
 from .config import config_path, load_config, reset_config, set_config
 from .core import (
@@ -203,7 +203,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(verify_artifact(artifact, receipt, envelope), sort_keys=True))
             return 0
         if args.command == "resume":
-            print(json.dumps(resume_journal(args.journal), sort_keys=True))
+            print(json.dumps(resume_batch_journal(args.journal), sort_keys=True))
             return 0
         if args.command == "qualify-run":
             if not args.deterministic_fake_runtime:

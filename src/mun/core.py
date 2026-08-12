@@ -12,11 +12,12 @@ from types import SimpleNamespace
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 from .errors import MunError
 from .containment import ContainmentError, run_contained
 from .models import InstalledModel, VerificationResult, verify_installed_model
+from .journal import OperationJournal
 from . import __version__
 from .transcript import (
     SCHEMA_VERSION,
@@ -146,6 +147,45 @@ def _sha256_file(path: Path) -> str | None:
         return digest.hexdigest()
     except OSError:
         return None
+
+
+def _journal_binding(
+    media: SourceMedia,
+    model: InstalledModel,
+    options: TranscriptionOptions,
+    formats: list[str],
+    base: Path,
+    overwrite: bool,
+    runtime: Any,
+) -> dict[str, Any]:
+    source_sha256 = _sha256_file(media.source)
+    artifact_sha256 = getattr(runtime, "model_artifact_sha256", None)
+    resumable = source_sha256 is not None and (
+        artifact_sha256 is None or isinstance(artifact_sha256, str) and len(artifact_sha256) == 64
+    )
+    return {
+        "source_sha256": source_sha256 or hashlib.sha256(str(media.source).encode("utf-8")).hexdigest(),
+        "resumable": resumable,
+        "source_path": str(media.source.resolve()),
+        "relative_path": str(media.relative),
+        "model": asdict(model),
+        "runtime": {
+            "name": runtime.info.name,
+            "version": runtime.info.version,
+            "requested_device": runtime.info.requested_device,
+            "effective_device": runtime.info.effective_device,
+            "precision": runtime.info.precision,
+            "model_artifact_sha256": artifact_sha256,
+        },
+        "options": asdict(options),
+        "formats": list(formats),
+        "base": str(base.resolve()),
+        "overwrite": overwrite,
+    }
+
+
+def _journal_source_key(media: SourceMedia) -> str:
+    return _sha256_file(media.source) or hashlib.sha256(str(media.source).encode("utf-8")).hexdigest()
 
 
 def _source_record(media: SourceMedia, sha256: str | None = None) -> SourceRecord:
@@ -570,6 +610,7 @@ def run_batch(
     progress: Callable[[str], None],
     runtime: Any | None = None,
     jobs: int = 1,
+    fault_injector: Callable[[str], None] | None = None,
 ) -> tuple[list[TranscriptResult], list[dict[str, str]]]:
     summaries: list[TranscriptResult] = []
     failures: list[dict[str, str]] = []
@@ -677,14 +718,41 @@ def run_batch(
     else:
         fallback_runtime = runtime
 
+    journal_path = output_dir / "mun-batch.journal.json"
+    bindings = [
+        _journal_binding(item, model, options, formats, base, overwrite, fallback_runtime)
+        for _, item, base in queued
+    ]
+    journal = OperationJournal.load(journal_path) if journal_path.exists() else OperationJournal.create(journal_path, bindings)
+
     if jobs == 1:
         for queued_position, (index, item, base) in enumerate(queued):
             progress(f"[{index}/{len(media)}] transcribing {item.source} ({effective_device}, {model.id})")
             try:
+                source_sha256 = _journal_source_key(item)
+                journal.transition(source_sha256, "inference_started")
+                if fault_injector:
+                    fault_injector("pre_inference")
                 result = transcribe_source(runtime, item, model, options)
                 result = replace(result, reuse_status=queued_status[index])
+                journal.transition(
+                    source_sha256,
+                    "inference_completed",
+                    evidence={"result": result.to_dict(), "result_digest": result.result_digest},
+                )
+                if fault_injector:
+                    fault_injector("post_inference_pre_render")
                 if result.status == "completed":
-                    write_result_outputs(base, formats, result, options.translate, overwrite=overwrite)
+                    def export_transition(state: str, evidence: dict[str, Any]) -> None:
+                        journal.transition(source_sha256, state, evidence=evidence)
+                        if fault_injector:
+                            fault_injector("render_staged" if state == "render_staged" else "partial_commit")
+
+                    write_result_outputs(
+                        base, formats, result, options.translate, overwrite=overwrite,
+                        transition=export_transition,
+                    )
+                    journal.transition(source_sha256, "committed", evidence={"verified": True})
                 queued_results[index] = result
                 progress(f"[{index}/{len(media)}] {result.status} {item.source}")
             except KeyboardInterrupt:
@@ -744,6 +812,7 @@ def run_batch(
     futures: dict[Any, int] = {}
     try:
         for index, item, _ in queued:
+            journal.transition(_journal_source_key(item), "inference_started")
             futures[executor.submit(_run_batch_worker, (index, item))] = index
         for future in as_completed(futures):
             index = futures[future]
@@ -752,6 +821,11 @@ def run_batch(
             try:
                 _, result = future.result()
                 result = replace(result, reuse_status=queued_status[index])
+                journal.transition(
+                    _journal_source_key(item),
+                    "inference_completed",
+                    evidence={"result": result.to_dict(), "result_digest": result.result_digest},
+                )
             except Exception:
                 result = TranscriptResult(
                     schema_version=SCHEMA_VERSION,
@@ -779,7 +853,16 @@ def run_batch(
             base = base_by_index[index]
             if result.status == "completed":
                 try:
-                    write_result_outputs(base, formats, result, options.translate, overwrite=overwrite)
+                    source_sha256 = _journal_source_key(media_by_index[index])
+
+                    def export_transition(state: str, evidence: dict[str, Any]) -> None:
+                        journal.transition(source_sha256, state, evidence=evidence)
+
+                    write_result_outputs(
+                        base, formats, result, options.translate, overwrite=overwrite,
+                        transition=export_transition,
+                    )
+                    journal.transition(source_sha256, "committed", evidence={"verified": True})
                 except ExportCommitError:
                     result = replace(
                         result,
@@ -825,7 +908,16 @@ def run_batch(
         base = base_by_index.get(index)
         if result.status == "completed" and base is not None:
             try:
-                write_result_outputs(base, formats, result, options.translate, overwrite=overwrite)
+                source_sha256 = _journal_source_key(media_by_index[index])
+
+                def export_transition(state: str, evidence: dict[str, Any]) -> None:
+                    journal.transition(source_sha256, state, evidence=evidence)
+
+                write_result_outputs(
+                    base, formats, result, options.translate, overwrite=overwrite,
+                    transition=export_transition,
+                )
+                journal.transition(source_sha256, "committed", evidence={"verified": True})
             except ExportCommitError:
                 result = replace(
                     result,
@@ -965,6 +1057,8 @@ def write_result_outputs(
     result: TranscriptResult,
     translated: bool,
     overwrite: bool,
+    transition: Callable[[str, dict[str, Any]], None] | None = None,
+    resume_artifacts: Mapping[str, str] | None = None,
 ) -> list[Path]:
     projections: list[tuple[Path, str, TranscriptResult]] = []
     for format_name in formats:
@@ -1002,7 +1096,11 @@ def write_result_outputs(
         )
         _atomic_write(receipt_path, receipt.to_json())
 
-    existing = [path for path in destinations if path.exists()]
+    resumable = resume_artifacts or {}
+    existing = [
+        path for path in destinations
+        if path.exists() and resumable.get(str(path)) != _sha256_file(path)
+    ]
     if existing and not overwrite:
         persist_receipt("failed_before_commit")
         raise MunError(f"Output already exists: {existing[0]}")
@@ -1030,7 +1128,17 @@ def write_result_outputs(
             artifacts.append(ExportArtifact(str(destination), digest, staged_path.stat().st_size))
             staged.append((staged_path, destination))
 
+        if transition:
+            transition("render_staged", {
+                "result": result.to_dict(),
+                "artifacts": [asdict(artifact) for artifact in artifacts],
+            })
+
         for staged_path, destination in staged:
+            expected_digest = next(artifact.sha256 for artifact in artifacts if artifact.path == str(destination))
+            if destination.exists() and resumable.get(str(destination)) == expected_digest:
+                committed.append(destination)
+                continue
             try:
                 staged_path.replace(destination)
             except BaseException as exc:
@@ -1039,6 +1147,13 @@ def write_result_outputs(
                     raise ExportCommitError(committed.copy(), [path for path in destinations if path not in committed]) from exc
                 raise
             committed.append(destination)
+            if transition and len(committed) < len(destinations):
+                transition("partial_commit", {
+                    "result": result.to_dict(),
+                    "artifacts": [asdict(artifact) for artifact in artifacts],
+                    "committed": [str(path) for path in committed],
+                    "uncommitted": [str(path) for path in destinations if path not in committed],
+                })
         persist_receipt("completed")
         return requested_destinations
     except KeyboardInterrupt:
