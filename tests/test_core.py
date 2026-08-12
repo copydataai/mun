@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -84,6 +85,114 @@ class OutputTests(unittest.TestCase):
 
 
 class ProbeTests(unittest.TestCase):
+    def test_runtime_provenance_distinguishes_direct_and_converted_audio(self) -> None:
+        from mun.runtime import TransformersRuntime
+
+        runtime = TransformersRuntime.__new__(TransformersRuntime)
+        runtime.info = type(
+            "Info",
+            (),
+            {
+                "name": "transformers",
+                "version": "1",
+                "requested_device": "cpu",
+                "effective_device": "cpu",
+                "precision": "float32",
+                "model_type": "whisper",
+            },
+        )()
+        runtime._run_pipeline = lambda path, options, task: Transcript("Hello", [], "en")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source.wav"
+            source.write_bytes(b"source wav")
+            direct_probe = type(
+                "Probe",
+                (),
+                {"media_format": "wav", "codec": "pcm_s16le", "sample_rate_hz": 16000, "channels": 1},
+            )()
+            with patch("mun.runtime._can_use_source_audio_directly", return_value=True), patch(
+                "mun.runtime._probe_media_details", return_value=direct_probe
+            ):
+                runtime.transcribe(source, TranscriptionOptions())
+            direct = runtime.prepared_media
+
+            prepared_bytes = b"prepared wav bytes"
+
+            def prepare(_source, destination):
+                destination.write_bytes(prepared_bytes)
+                return destination, True
+
+            with patch("mun.runtime._can_use_source_audio_directly", return_value=False), patch(
+                "mun.runtime._audio_input_path", side_effect=prepare
+            ), patch("mun.runtime.ffmpeg_version", return_value="ffmpeg 8.0"):
+                runtime.transcribe(source, TranscriptionOptions())
+            converted = runtime.prepared_media
+
+        self.assertFalse(direct.used)
+        self.assertEqual(direct.sha256, hashlib.sha256(b"source wav").hexdigest())
+        self.assertTrue(converted.used)
+        self.assertEqual(converted.sha256, hashlib.sha256(prepared_bytes).hexdigest())
+        self.assertEqual(converted.media_format, "wav")
+        self.assertEqual(converted.codec, "pcm_s16le")
+        self.assertEqual(converted.sample_rate_hz, 16000)
+        self.assertEqual(converted.channels, 1)
+        self.assertEqual(converted.converter.name, "ffmpeg")
+        self.assertEqual(converted.converter.version, "ffmpeg 8.0")
+
+    def test_runtime_provenance_records_probed_direct_media_format(self) -> None:
+        from mun import core
+        from mun.runtime import TransformersRuntime
+
+        core._FFPROBE_CACHE.clear()
+        core._BINARY_PATH_CACHE.clear()
+        runtime = TransformersRuntime.__new__(TransformersRuntime)
+        runtime.info = type(
+            "Info",
+            (),
+            {
+                "name": "transformers",
+                "version": "1",
+                "requested_device": "cpu",
+                "effective_device": "cpu",
+                "precision": "float32",
+                "model_type": "whisper",
+            },
+        )()
+        runtime._run_pipeline = lambda path, options, task: Transcript("Hello", [], "en")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source.aiff"
+            source.write_bytes(b"direct aiff bytes")
+            fake = type(
+                "Result",
+                (),
+                {
+                    "returncode": 0,
+                    "stdout": json.dumps(
+                        {
+                            "streams": [
+                                {"codec_type": "audio", "codec_name": "pcm_s16be", "channels": 1, "sample_rate": "16000"}
+                            ],
+                            "format": {"format_name": "aiff"},
+                        }
+                    ),
+                },
+            )()
+            with patch("mun.core.subprocess.run", return_value=fake) as run_probe, patch(
+                "shutil.which", return_value="/usr/bin/ffprobe"
+            ):
+                runtime.transcribe(source, TranscriptionOptions())
+
+        direct = runtime.prepared_media
+        self.assertFalse(direct.used)
+        self.assertEqual(direct.media_format, "aiff")
+        self.assertEqual(direct.codec, "pcm_s16be")
+        self.assertEqual(direct.sample_rate_hz, 16000)
+        self.assertEqual(direct.channels, 1)
+        self.assertIsNone(direct.converter)
+        self.assertEqual(run_probe.call_count, 1)
+
     def test_is_media_uses_cached_ffprobe_results(self) -> None:
         from mun import core
 

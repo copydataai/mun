@@ -24,7 +24,10 @@ from .core import (
     run_transcription_workflow,
 )
 from .errors import MunError
-from .transcript import make_batch_result
+from .qualification import create_qualification_record
+from .review import CorrectionError, CorrectionSet, apply_corrections, render_reviewed, reviewed_projection_receipt
+from .replay import ReplayOutcome, replay_result
+from .transcript import TranscriptResult, make_batch_result
 from .models import (
     download_model,
     find_installed,
@@ -33,13 +36,17 @@ from .models import (
     model_details,
     models_root,
     remote_model_summary,
-    remove_model,
+    remove_model_with_receipt,
     search_models,
 )
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="mun", description="Local-first batch speech-to-text")
+    parser = argparse.ArgumentParser(
+        prog="mun",
+        description="Transcribe audio and video on your computer",
+        epilog="Get started: mun transcribe recordings/",
+    )
     parser.add_argument("--version", action="version", version=f"mun {__version__}")
     subcommands = parser.add_subparsers(dest="command")
 
@@ -53,10 +60,10 @@ def build_parser() -> argparse.ArgumentParser:
     transcribe.add_argument("--timestamps", action="store_true", help="include segment timestamps")
     transcribe.add_argument("--language", help="spoken language name or code (Whisper only)")
     transcribe.add_argument("--translate", action="store_true", help="also translate speech to English")
-    transcribe.add_argument("--include-hidden", action="store_true")
-    transcribe.add_argument("--overwrite", action="store_true")
+    transcribe.add_argument("--include-hidden", action="store_true", help="include media inside hidden directories")
+    transcribe.add_argument("--overwrite", action="store_true", help="replace existing transcript files")
     transcribe.add_argument("--device", default=None, help="auto, cpu, mps, or cuda[:index]")
-    transcribe.add_argument("--offline", action="store_true")
+    transcribe.add_argument("--offline", action="store_true", help="disable Hugging Face network access")
     transcribe.add_argument("--stdout", action="store_true", help="write one TXT or JSON result to stdout")
     transcribe.add_argument("--summary-json", action="store_true", help="write batch summary JSON to stdout")
     transcribe.add_argument("--jobs", type=int, default=1, help="parallel batch workers (CPU runs only)")
@@ -76,6 +83,11 @@ def build_parser() -> argparse.ArgumentParser:
     download.add_argument("model_id")
     download.add_argument("--revision")
     download.add_argument("--trust-remote-code", action="store_true")
+    download.add_argument(
+        "--acknowledge-remote-code",
+        action="store_true",
+        help="acknowledge execution of code from this model's pinned repository snapshot",
+    )
     download.add_argument("--yes", action="store_true")
     download.add_argument("--offline", action="store_true")
     list_parser = model_subcommands.add_parser("list", help="list installed models")
@@ -95,6 +107,29 @@ def build_parser() -> argparse.ArgumentParser:
     config_set.add_argument("value")
     config_reset = config_subcommands.add_parser("reset")
     config_reset.add_argument("--yes", action="store_true")
+
+    review = subcommands.add_parser("review", help="apply or render transcript correction overlays")
+    review_subcommands = review.add_subparsers(dest="review_command", required=True)
+    review_apply = review_subcommands.add_parser("apply", help="validate corrections and write corrected JSON")
+    review_apply.add_argument("machine", type=Path, help="canonical machine-result JSON")
+    review_apply.add_argument("corrections", type=Path, help="correction-set JSON")
+    review_apply.add_argument("-o", "--output", type=Path, required=True, help="new corrected JSON path")
+    review_render = review_subcommands.add_parser("render", help="render the machine or corrected transcript")
+    review_render.add_argument("machine", type=Path, help="canonical machine-result JSON")
+    review_render.add_argument("--corrections", type=Path, help="correction-set JSON")
+    review_render.add_argument("--view", choices=("machine", "corrected"), default="machine")
+    review_render.add_argument("--format", choices=("txt", "json", "srt", "vtt"), default="txt")
+    review_render.add_argument("-o", "--output", type=Path, help="write the projection to a file")
+
+    replay = subcommands.add_parser("replay", help="verify a transcript result by bounded replay")
+    replay.add_argument("result", type=Path, help="canonical transcript result JSON")
+    replay.add_argument("--source", type=Path, help="source media; defaults to the recorded relative path")
+    replay.add_argument("--model-dir", help="managed model directory")
+    replay.add_argument("--tolerances", type=Path, help="explicit live-model tolerance JSON")
+
+    qualify = subcommands.add_parser("qualify", help="create an unsigned local exact-tuple qualification record")
+    qualify.add_argument("manifest", type=Path, help="physical-run manifest JSON")
+    qualify.add_argument("-o", "--output", type=Path, required=True, help="qualification record JSON")
 
     doctor = subcommands.add_parser("doctor", help="diagnose the local runtime")
     doctor.add_argument("--json", action="store_true")
@@ -117,13 +152,19 @@ def main(argv: list[str] | None = None) -> int:
             return command_models(args)
         if args.command == "config":
             return command_config(args)
+        if args.command == "review":
+            return command_review(args)
+        if args.command == "replay":
+            return command_replay(args)
+        if args.command == "qualify":
+            return command_qualify(args)
         if args.command == "doctor":
             return command_doctor(args)
         parser.print_help()
         return 2
     except KeyboardInterrupt:
-        print("\nCancelled; completed outputs were preserved.", file=sys.stderr)
-        return 130
+        print("\nCancelled; export receipts were flushed and completed outputs were preserved.", file=sys.stderr)
+        return 1
     except MunError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -133,7 +174,7 @@ def interactive_wizard() -> int:
     print("Mun — local speech-to-text\n")
     config = load_config()
     root = models_root(config)
-    models = [model for model in installed_models(root) if model.status == "ready"]
+    models = [model for model in installed_models(root) if model.status in {"installed", "ready"}]
     if not models:
         default = load_catalog()["models"][0]
         print(f"No speech model is installed. Recommended: {default['id']}")
@@ -142,11 +183,11 @@ def interactive_wizard() -> int:
             print(f"Run 'mun models search' or 'mun models download {default['id']}' when ready.")
             return 0
         download_model(default["id"], root, default["revision"], False, False)
-        models = [model for model in installed_models(root) if model.status == "ready"]
+        models = [model for model in installed_models(root) if model.status in {"installed", "ready"}]
     print("Installed models:")
     for index, model in enumerate(models, start=1):
         print(f"  {index}. {model.id} ({model.revision[:12]})")
-    choice = input(f"Model [1]: ").strip()
+    choice = input("Model [1]: ").strip()
     try:
         model = models[int(choice or "1") - 1]
     except (ValueError, IndexError) as exc:
@@ -156,10 +197,10 @@ def interactive_wizard() -> int:
         raise MunError("At least one file or directory is required")
     output_dir = input("Output directory [transcripts]: ").strip() or "transcripts"
     args = argparse.Namespace(
-        inputs=shlex.split(entered_paths), input_list=None, model=model.id, model_dir=str(root),
+        inputs=shlex.split(entered_paths), input_list=None, model=model.path, model_dir=str(root),
         output_dir=output_dir, format=["txt"], timestamps=False, language=None, translate=False,
         include_hidden=False, overwrite=False, device=None, offline=False, stdout=False,
-        summary_json=False, jobs=1, chunk_length=30, stride_length=5,
+        summary_json=False, jobs=1, benchmark=False, chunk_length=30, stride_length=5,
     )
     return command_transcribe(args)
 
@@ -211,25 +252,32 @@ def command_transcribe(args: argparse.Namespace) -> int:
             sys.stdout.write(render_output(formats[0], result, media[0], model, runtime.info.effective_device))
             return 0
         output_dir = Path(args.output_dir or config.get("output_dir", "transcripts")).expanduser().resolve()
-        progress = lambda message: print(message, file=sys.stderr)
+        def progress(message: str) -> None:
+            print(message, file=sys.stderr)
+
         started_at = time.perf_counter() if args.benchmark else None
-        summaries, failures = run_batch(
-            media,
-            model,
-            output_dir,
-            formats,
-            options,
-            args.overwrite,
-            progress,
-            runtime=runtime,
-            jobs=args.jobs,
-        )
+        try:
+            summaries, failures = run_batch(
+                media,
+                model,
+                output_dir,
+                formats,
+                options,
+                args.overwrite,
+                progress,
+                runtime=runtime,
+                jobs=args.jobs,
+            )
+        except KeyboardInterrupt:
+            print("Cancelled; export receipts were flushed and completed sources were preserved.", file=sys.stderr)
+            return 1
         if args.benchmark and started_at is not None:
             elapsed = time.perf_counter() - started_at
-            completed = sum(result.status == "completed" for result in summaries)
-            throughput = completed / elapsed if elapsed else 0.0
+            processed = sum(result.reuse_status in {"queued", "overwrite_required"} for result in summaries)
+            reused = sum(result.reuse_status == "reused_verified" for result in summaries)
+            throughput = processed / elapsed if elapsed else 0.0
             print(
-                f"Benchmark: files={len(media)} completed={completed} failed={len(failures)} "
+                f"Benchmark: files={len(media)} processed={processed} reused_verified={reused} failed={len(failures)} "
                 f"duration_s={elapsed:.2f} files_per_s={throughput:.2f} jobs={args.jobs}",
                 file=sys.stderr,
             )
@@ -242,12 +290,112 @@ def command_transcribe(args: argparse.Namespace) -> int:
         return 1 if incomplete else 0
 
 
+def command_review(args: argparse.Namespace) -> int:
+    machine = _read_machine_result(args.machine)
+    if args.review_command == "apply":
+        corrected = apply_corrections(machine, _read_correction_set(args.corrections))
+        try:
+            with args.output.open("x", encoding="utf-8", newline="\n") as handle:
+                handle.write(corrected.to_json())
+        except FileExistsError as exc:
+            raise MunError(f"Refusing to overwrite existing corrected export: {args.output}") from exc
+        except OSError as exc:
+            raise MunError(f"Cannot write corrected export {args.output}: {exc}") from exc
+        return 0
+
+    corrected = None
+    if args.view == "corrected":
+        if args.corrections is None:
+            raise CorrectionError("--corrections is required for corrected rendering")
+        corrected = apply_corrections(machine, _read_correction_set(args.corrections))
+    rendered = render_reviewed(args.format, machine, corrected, args.view)
+    if args.output is None:
+        sys.stdout.write(rendered)
+        return 0
+
+    receipt_path = Path(f"{args.output}.receipt.json")
+    existing = next((path for path in (args.output, receipt_path) if path.exists()), None)
+    if existing is not None:
+        raise MunError(f"Refusing to overwrite existing reviewed export: {existing}")
+    output_bytes = rendered.encode("utf-8")
+    try:
+        with args.output.open("xb") as handle:
+            handle.write(output_bytes)
+        if corrected is not None:
+            receipt = reviewed_projection_receipt(args.format, corrected, output_bytes, args.output.name)
+            with receipt_path.open("x", encoding="utf-8", newline="\n") as handle:
+                handle.write(receipt.to_json())
+    except OSError as exc:
+        raise MunError(f"Cannot write reviewed export {args.output}: {exc}") from exc
+    return 0
+
+
+def command_replay(args: argparse.Namespace) -> int:
+    try:
+        expected = TranscriptResult.from_json(args.result.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        outcome = ReplayOutcome("unsupported_replay", reason=f"invalid_result:{type(exc).__name__}")
+    else:
+        source = args.source or args.result.parent / expected.source.relative_path
+        config = load_config()
+        root = models_root(config, args.model_dir)
+        try:
+            model = find_installed(root, expected.provenance.model.repository)
+            runtime = load_pipeline(model, expected.provenance.requested_device)[0]
+        except MunError as exc:
+            outcome = ReplayOutcome("artifact_unavailable", reason=str(exc))
+        else:
+            outcome = replay_result(
+                args.result,
+                source=source,
+                model=model,
+                runtime=runtime,
+                tolerance_file=args.tolerances,
+            )
+    print(json.dumps(outcome.to_dict(), ensure_ascii=False, indent=2))
+    if outcome.kind in {"exact_match", "projection_match", "within_tolerance"}:
+        return 0
+    if outcome.kind == "unsupported_replay":
+        return 2
+    return 1
+
+
+def command_qualify(args: argparse.Namespace) -> int:
+    try:
+        manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise MunError(f"Cannot read qualification manifest {args.manifest}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise MunError(f"Invalid qualification manifest {args.manifest}: {exc}") from exc
+    record = create_qualification_record(manifest, base_dir=args.manifest.parent)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"Wrote unsigned local qualification record to {args.output}")
+    return 0
+
+
+def _read_machine_result(path: Path) -> TranscriptResult:
+    try:
+        return TranscriptResult.from_json(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise MunError(f"Cannot read machine result {path}: {exc}") from exc
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise MunError(f"Invalid machine result {path}: {exc}") from exc
+
+
+def _read_correction_set(path: Path) -> CorrectionSet:
+    try:
+        return CorrectionSet.from_json(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise MunError(f"Cannot read correction set {path}: {exc}") from exc
+
+
 def command_models(args: argparse.Namespace) -> int:
     config = load_config()
     root = models_root(config, args.model_dir)
     if args.models_command == "search":
         records = search_models(args.query, args.limit, args.offline or config.get("offline", False))
-        _print_records(records, args.json, ("id", "compatibility", "quality", "downloads"))
+        _print_records(records, args.json, ("id", "library", "gated", "downloads"))
         return 0
     if args.models_command == "list":
         records = [asdict(model) for model in installed_models(root)]
@@ -258,12 +406,29 @@ def command_models(args: argparse.Namespace) -> int:
             raise MunError("Cannot download models in offline mode")
         summary = remote_model_summary(args.model_id, args.revision)
         _print_mapping(summary)
+        acknowledgement = f"{args.model_id}@{summary['revision']}"
+        remote_code_acknowledged = args.acknowledge_remote_code or config.get("remote_code_acknowledgement") == acknowledgement
         if args.trust_remote_code:
-            print("WARNING: this model may execute Python code from its repository.", file=sys.stderr)
+            print(
+                "WARNING: this pinned snapshot may execute repository Python code. It remains unsafe, untested, and ineligible for agent use.",
+                file=sys.stderr,
+            )
+            if not remote_code_acknowledged:
+                raise MunError(
+                    "Remote repository code requires --acknowledge-remote-code or an exact "
+                    f"remote_code_acknowledgement={acknowledgement} configuration value"
+                )
         if not args.yes and not _confirm("Download this immutable model snapshot?"):
             print("Cancelled.")
             return 0
-        model = download_model(args.model_id, root, args.revision, args.trust_remote_code, False)
+        model = download_model(
+            args.model_id,
+            root,
+            args.revision,
+            args.trust_remote_code,
+            False,
+            remote_code_acknowledged=remote_code_acknowledged,
+        )
         print(f"Installed {model.id}@{model.revision} in {_redact_home(model.path)}")
         return 0
     if args.models_command == "info":
@@ -277,12 +442,15 @@ def command_models(args: argparse.Namespace) -> int:
                 _print_mapping(details["catalog"])
         return 0
     if args.models_command == "remove":
-        model = find_installed(root, args.target)
-        if not args.yes and not _confirm(f"Remove {model.id}@{model.revision[:12]}?"):
-            print("Cancelled.")
-            return 0
-        removed, reclaimed = remove_model(root, model.path)
-        print(f"Removed {removed.id}; reclaimed {_human_bytes(reclaimed)}")
+        try:
+            model = find_installed(root, args.target)
+            if not args.yes and not _confirm(f"Remove {model.id}@{model.revision[:12]}?"):
+                print("Cancelled.")
+                return 0
+            receipt = remove_model_with_receipt(root, model.path)
+        except MunError as exc:
+            raise MunError(_redact_home(str(exc))) from exc
+        print(json.dumps(receipt.to_dict(), indent=2))
         return 0
     raise MunError("Unknown models command")
 
@@ -392,7 +560,7 @@ def _confirm(prompt: str) -> bool:
 
 def _redact_home(value: str) -> str:
     home = str(Path.home())
-    return value.replace(home, "~") if value.startswith(home) else value
+    return value.replace(home, "~")
 
 
 def _existing_ancestor(path: Path) -> Path:

@@ -12,12 +12,13 @@ invented values.
 ```json
 {
   "schema_version": 1,
+  "result_digest": "sha256-of-the-canonical-identity-bytes",
   "status": "completed",
   "source": {
     "name": "interview.wav",
     "relative_path": "sessions/interview.wav",
     "duration_ms": 92000,
-    "sha256": null
+    "sha256": "sha256-of-the-exact-source-bytes"
   },
   "transcripts": [
     {
@@ -66,19 +67,157 @@ invented values.
       "revision": "immutable-commit-sha",
       "artifact_sha256": null
     },
-    "runtime": {"name": "transformers", "version": "5.x"},
+    "runtime": {
+      "name": "transformers",
+      "version": "5.x",
+      "environment": {
+        "python_version": "3.11.14",
+        "python_implementation": "CPython",
+        "operating_system": "darwin",
+        "machine": "arm64"
+      }
+    },
     "requested_device": "auto",
     "effective_device": "mps",
     "precision": "float16"
+  },
+  "operation": {
+    "parameters": {
+      "language": "es",
+      "timestamps": true,
+      "translate": true,
+      "chunk_length": 30,
+      "stride_length": 5,
+      "requested_device": "auto",
+      "effective_device": "mps",
+      "precision": "float16"
+    },
+    "prepared_media": {
+      "used": true,
+      "sha256": "sha256-of-the-exact-wav-passed-to-the-runtime",
+      "media_format": "wav",
+      "sample_rate_hz": 16000,
+      "channels": 1,
+      "converter": {"name": "ffmpeg", "version": "ffmpeg version 8.0"}
+    },
+    "source_hash_policy": "sha256_source_bytes"
   }
 }
 ```
 
 Required top-level fields are `schema_version`, `status`, `source`,
-`transcripts`, `speakers`, `diagnostics`, and `provenance`. Optional scalar
+`transcripts`, `speakers`, `diagnostics`, `provenance`, `trust`, and
+`agent_eligibility`. Optional scalar
 values are `null`; optional collections are empty arrays. Absolute source paths
-are excluded by default. An explicit diagnostic mode may add one, and source
-hashing is opt-in because it reads the complete media file.
+are excluded by default. An explicit diagnostic mode may add one. Mun hashes the
+complete source bytes before transcription. The `sha256_source_bytes` policy
+means the digest identifies byte content independently of the source path.
+
+`operation.parameters` records every `TranscriptionOptions` value that can affect
+inference, together with the runtime's effective device and precision. The
+prepared-media record describes the exact audio input passed to the speech
+runtime. For a directly usable 16 kHz mono PCM WAV, `used` is `false`, its digest
+matches the runtime input, and `converter` is `null`. When Mun converts media,
+`used` is `true`, the digest covers the exact temporary WAV after FFmpeg exits,
+and the record includes WAV format, sample rate, channels, and the FFmpeg version.
+Temporary paths and names are never recorded.
+
+Runtime environment fields are limited to stable, non-secret replay facts:
+Python version and implementation, operating-system identifier, and machine
+architecture. They do not contain usernames, home directories, environment
+variables, hostnames, absolute paths, or secrets.
+
+## Typed trust and agent eligibility
+
+Trust is additive provenance, not a safety claim. Every canonical result records:
+
+- media as `untrusted_bytes`;
+- model as `verified_artifact` or `unsafe_remote_code`;
+- machine content as `untrusted_model_output`; and
+- agent eligibility as `ineligible` with a human-judgment reason.
+
+Artifact verification means local bytes match the pinned manifest. It does not make model behavior or transcript text trusted. A corrected transcript remains `untrusted_content`, remains agent-ineligible, and adds review state, correction-set ID, and correction-set digest. Loaders accept legacy schema-version-1 results by assigning the conservative defaults. No transition can remove media or content taint, including results produced by unsafe remote code.
+
+## Machine result identity
+
+`result_digest` is the SHA-256 digest of canonical UTF-8 JSON bytes for the
+machine result. Canonicalization sorts object keys, uses compact JSON syntax,
+and normalizes CRLF and CR string newlines to LF. Array order remains
+significant. The canonical identity excludes the `result_digest` claim itself
+and observational receipt fields named `created_at`.
+
+The identity therefore covers source identity, the exact prepared input,
+model repository, revision and verified artifact-manifest digest, runtime and
+stable environment facts, inference parameters, every transcript variant,
+speakers, status, overlap, and diagnostics. Changing any of those facts changes
+the digest. Equivalent results recorded at different creation times retain the
+same digest.
+
+Readers may continue to accept legacy schema-version-1 records without a
+`result_digest`. When a digest is present, loaders must recompute it and reject
+a mismatch as a typed validation failure. Additive unknown fields participate
+in identity and remain compatible with the schema rule below.
+
+Result identity proves only that a claimed record is consistent with its
+recorded derivation inputs and outputs. It does not prove recognition
+correctness, semantic accuracy, authenticity, or truth.
+
+## Immutable correction overlays
+
+Human corrections are stored separately from the canonical machine result. Mun
+never edits the machine-result object or JSON. A schema-version-1 correction set
+contains:
+
+```json
+{
+  "schema_version": 1,
+  "correction_set_id": "review-2026-08-12-a",
+  "created_at": "2026-08-12T19:00:00Z",
+  "parent_result_digest": "exact-machine-result-digest",
+  "review_state": "reviewed",
+  "corrections": [
+    {
+      "transcript_kind": "original",
+      "segment_id": "segment_1",
+      "original_text_digest": "sha256-of-the-exact-original-segment-text",
+      "replacement": "Corrected text.",
+      "note": "Optional note, at most 500 characters."
+    }
+  ]
+}
+```
+
+`review_state` is explicitly `reviewed` or `unreviewed`. Targets are unique
+within a correction set. Application requires an exact parent digest, an
+existing transcript-kind and segment-ID pair, and a matching SHA-256 digest of
+the original segment's UTF-8 text. Any mismatch rejects the complete overlay;
+Mun does not partially apply it. Replacement text and notes remain untrusted
+data and are never interpreted as markup, commands, or proof.
+
+A machine-view JSON export explicitly records `view: "machine"`,
+`review_state: "unreviewed"`, and the unchanged machine `result_digest` as its
+export digest. A corrected JSON export is a derived envelope with
+`view: "corrected"`, the
+review state, parent result digest, correction-set ID and digest, a corrected
+transcript projection, and its own `export_digest`. It is distinct from the
+machine result and does not replace or acquire the machine `result_digest`.
+The correction-set digest covers its ID, timestamp, parent, review state, and
+all targets and replacement data using stable JSON encoding.
+Corrected TXT, SRT, and VTT select replacement text while retaining the machine
+segments' IDs, ordering, speakers, and timing intervals. The variant-level text
+is rebuilt from the corrected segments in source order.
+
+When a corrected projection is written to a file, Mun writes an adjacent
+`<projection>.receipt.json`. The receipt identifies the corrected view and
+review state, parent result digest, correction-set ID and digest, renderer
+parameters, SHA-256 digest of the exact projection bytes, and the destination
+file name without exposing parent directories. Corrected JSON retains the same
+identity and review metadata in its envelope and uses the same adjacent receipt
+shape when rendered to a file.
+
+Human review records that a person handled the correction set. It does not
+establish truth, authenticity, honesty, semantic accuracy, consent, custody, or
+producer identity.
 
 ## Invariants
 
@@ -103,7 +242,10 @@ hashing is opt-in because it reads the complete media file.
   secret, username, home path, or absolute source path by default.
 - Provenance identifies the exact model revision, derived artifact when used,
   runtime, requested and effective device, precision, Mun version, and creation
-  time. Unavailable values remain `null`.
+  time. Unavailable values remain `null`. Creation time is observational and
+  does not participate in result identity.
+- SHA-256 digests establish byte identity only. They do not establish
+  authenticity, consent, custody or continuity, or semantic correctness.
 
 Schema version 1 permits additive fields. Consumers must ignore unknown fields.
 Removing a field, changing its meaning or type, or tightening previously valid
@@ -116,9 +258,27 @@ A batch machine result contains `schema_version`, an ordered `files` array of
 continues after a file failure. Completed outputs remain preserved on failure
 or cancellation.
 
-The CLI exits 0 when every requested file completes, 1 when any file is partial
-or failed, and 130 when cancelled. It writes diagnostics to stderr and reserves
-stdout for the requested machine result.
+The CLI exits 0 when every requested file completes, 1 when any file is partial,
+failed, or cancelled, and 2 for command-line usage errors. It writes diagnostics
+to stderr and reserves stdout for the requested machine result.
+
+## Export transaction receipts
+
+Each completed transcript result is exported as a per-source transaction. Mun
+renders every requested projection into a mode-0700 staging directory beside
+the destinations, hashes and validates staged content, refuses any existing
+destination unless overwrite was explicitly requested, and commits in sorted
+destination-path order. The staging directory is removed after success,
+pre-commit failure, or cancellation.
+
+Mun atomically replaces each individual file, but does not claim multi-file
+filesystem atomicity. A receipt named `<output-base>.receipt.json` records
+`completed`, `cancelled`, `failed_before_commit`, or `partial_commit`, the staged
+artifact hashes and sizes, and exact committed and uncommitted destination
+paths. `partial_commit` means at least one destination was committed before a
+later commit failed. A workflow-boundary interruption is reported as cancelled
+with exit status 1 after its receipt has been flushed; previously completed
+sources remain committed.
 
 ## Deterministic renderers
 
@@ -136,13 +296,13 @@ All text files use UTF-8 and LF endings.
   explanatory comments. It is for people and configuration-aware tools, not
   the CLI machine protocol.
 - **SRT** and **VTT** project one cue per timed segment without merging,
-  splitting, line wrapping, or text correction. Cues retain source order and
+  splitting, or line wrapping. Machine view retains machine text; corrected
+  view selects a validated correction overlay. Cues retain source order and
   may overlap. A speaker label, when present, prefixes cue text as
   `[speaker_1] `. With English translation requested, Mun writes `.original`
   and `.en` files only for variants that contain timed segments.
 
 JSON, JSONC, and Markdown each contain all transcript variants in one file.
-Requesting a renderer that cannot represent available data records a diagnostic
-and makes that file result `partial`; other requested renderings are still
-written atomically. Existing files are never overwritten without explicit
-permission.
+Requesting a renderer that cannot represent available data fails before commit,
+so no projection from that source reaches a final path. Existing files are never
+overwritten without explicit permission.

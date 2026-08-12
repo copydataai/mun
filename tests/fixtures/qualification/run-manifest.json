@@ -1,0 +1,53 @@
+{
+  "generated_at": "2026-08-12T12:00:00Z",
+  "expiry_days": 90,
+  "physical_execution": true,
+  "run_outcome": "passed",
+  "mun": {"version": "0.1.0", "revision": "b76fd52"},
+  "runtime": {"name": "transformers", "version": "5.14.0", "manifest_sha256": "runtime-pack-digest"},
+  "model": {
+    "repository": "openai/whisper-small",
+    "revision": "model-revision",
+    "artifact_sha256": "model-artifact-digest",
+    "manifest_sha256": "model-manifest-digest"
+  },
+  "platform": {
+    "os": "macOS",
+    "os_version": "14.7.6",
+    "kernel": "23.6.0",
+    "architecture": "arm64",
+    "python": "3.12.11"
+  },
+  "device": {
+    "name": "Apple M1",
+    "backend": "mps",
+    "driver_version": "Metal 310.15",
+    "accelerator_target": "Apple M1",
+    "physical_memory_bytes": 8589934592,
+    "device_memory_bytes": null,
+    "recommended_working_set_bytes": 6442450944,
+    "requested": "mps",
+    "effective": "mps",
+    "precision": "float16"
+  },
+  "fixtures": [
+    {"path": "smoke.txt", "role": "smoke"},
+    {"path": "performance.txt", "role": "performance"}
+  ],
+  "timing": {
+    "cold": {"load_seconds": 1.25, "end_to_end_seconds": 2.5},
+    "warm": {"samples_seconds": [5.0, 4.0, 6.0], "audio_seconds": 60.0}
+  },
+  "peak_memory": {
+    "process_rss_bytes": 2147483648,
+    "available_system_bytes_at_start": 4294967296,
+    "device_allocated_bytes": 1073741824,
+    "device_reserved_bytes": 1610612736,
+    "measurement": "allocator-visible"
+  },
+  "advertised_capabilities": ["transcription", "timestamps"],
+  "capabilities": [
+    {"name": "transcription", "outcome": "passed"},
+    {"name": "timestamps", "outcome": "passed"}
+  ]
+}

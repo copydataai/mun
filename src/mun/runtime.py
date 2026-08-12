@@ -1,14 +1,25 @@
 from __future__ import annotations
 
+import hashlib
+import subprocess
 import tempfile
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Protocol
 
-from .core import Segment, Transcript, TranscriptionOptions, _audio_input_path, _can_use_source_audio_directly
+from .core import (
+    Segment,
+    Transcript,
+    TranscriptionOptions,
+    _audio_input_path,
+    _cached_binary_path,
+    _can_use_source_audio_directly,
+    _probe_media_details,
+)
 from .errors import MunError
-from .models import InstalledModel
+from .models import InstalledModel, verify_installed_model
+from .transcript import ConverterIdentity, ModelTrust, PreparedMediaRecord
 
 
 @dataclass(frozen=True)
@@ -19,6 +30,7 @@ class RuntimeInfo:
     effective_device: str
     precision: str | None
     model_type: str
+    model_trust: ModelTrust = "verified_artifact"
 
 
 class SpeechRuntime(Protocol):
@@ -29,6 +41,14 @@ class SpeechRuntime(Protocol):
 
 class TransformersRuntime:
     def __init__(self, model: InstalledModel, requested_device: str = "auto") -> None:
+        if model.trust_remote_code and not model.remote_code_acknowledged:
+            raise MunError("Remote repository code has not been explicitly acknowledged for this pinned revision")
+        verification = verify_installed_model(model)
+        if verification.status not in {"verified", "unsafe_remote_code"}:
+            detail = f" ({', '.join(verification.paths)})" if verification.paths else ""
+            raise MunError(
+                f"Model integrity verification failed: {verification.status}{detail}. {verification.guidance}".strip()
+            )
         try:
             import torch
             from transformers import AutoConfig, pipeline
@@ -45,6 +65,14 @@ class TransformersRuntime:
                 dtype=dtype,
                 trust_remote_code=model.trust_remote_code,
             )
+            loaded_verification = verify_installed_model(model)
+            if (
+                loaded_verification.status not in {"verified", "unsafe_remote_code"}
+                or loaded_verification.artifact_digest is None
+                or loaded_verification.artifact_digest != verification.artifact_digest
+            ):
+                raise MunError("The installed model changed while the runtime was loading")
+            self.model_artifact_sha256 = loaded_verification.artifact_digest
             self.info = RuntimeInfo(
                 name="transformers",
                 version=_package_version("transformers"),
@@ -52,11 +80,13 @@ class TransformersRuntime:
                 effective_device=device,
                 precision="float16" if dtype is torch.float16 else "float32",
                 model_type=config.model_type,
+                model_trust="unsafe_remote_code" if model.trust_remote_code else "verified_artifact",
             )
         except Exception as exc:
             raise MunError(f"Could not load {model.id}: {exc}") from exc
 
     def transcribe(self, source: Path, options: TranscriptionOptions) -> tuple[Transcript, Transcript | None]:
+        self.prepared_media = None
         model_type = self.info.model_type
         if options.timestamps and model_type not in {"whisper", "wav2vec2", "hubert", "wavlm"}:
             raise MunError(f"The selected {model_type} model cannot provide timestamps")
@@ -64,12 +94,14 @@ class TransformersRuntime:
             raise MunError("Language selection and English translation require a Whisper-family model")
         if _can_use_source_audio_directly(source):
             wav_path = source
+            self.prepared_media = _prepared_media_record(wav_path, used=False)
             original = self._run_pipeline(wav_path, options, task="transcribe")
             translated = self._run_pipeline(wav_path, options, task="translate") if options.translate else None
             return original, translated
 
         with tempfile.TemporaryDirectory(prefix="mun-") as temporary_directory:
             wav_path, _ = _audio_input_path(source, Path(temporary_directory) / "audio.wav")
+            self.prepared_media = _prepared_media_record(wav_path, used=True)
             original = self._run_pipeline(wav_path, options, task="transcribe")
             translated = self._run_pipeline(wav_path, options, task="translate") if options.translate else None
             return original, translated
@@ -97,6 +129,7 @@ class FakeSpeechRuntime:
         self._original = original
         self._translated = translated
         self.info = RuntimeInfo("test", "0", "test", "cpu", "test", "whisper")
+        self.prepared_media: PreparedMediaRecord | None = None
 
     def transcribe(self, source: Path, options: TranscriptionOptions) -> tuple[Transcript, Transcript | None]:
         return self._original, self._translated if options.translate else None
@@ -127,3 +160,38 @@ def _package_version(package: str) -> str | None:
         return version(package)
     except PackageNotFoundError:
         return None
+
+
+def _sha256_file(path: Path) -> str | None:
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def ffmpeg_version() -> str | None:
+    try:
+        ffmpeg = _cached_binary_path("ffmpeg", "FFmpeg is not installed. Install FFmpeg and try again.")
+        result = subprocess.run([ffmpeg, "-version"], capture_output=True, text=True, check=False)
+    except (MunError, OSError):
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    return result.stdout.splitlines()[0].strip()
+
+
+def _prepared_media_record(path: Path, *, used: bool) -> PreparedMediaRecord:
+    probe = None if used else _probe_media_details(path)
+    return PreparedMediaRecord(
+        used=used,
+        sha256=_sha256_file(path),
+        media_format="wav" if used else probe.media_format,
+        codec="pcm_s16le" if used else probe.codec,
+        sample_rate_hz=16_000 if used else probe.sample_rate_hz,
+        channels=1 if used else probe.channels,
+        converter=ConverterIdentity("ffmpeg", ffmpeg_version()) if used else None,
+    )

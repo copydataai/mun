@@ -74,11 +74,33 @@ First load can promote only the attempted runtime/device tuple to
 `load-verified`. Only reviewed compatibility-matrix evidence grants `tested`.
 Unknown and failed are not synonyms for unsupported.
 
+Exact-tuple evidence is represented by the qualification record documented in
+`docs/qualification/README.md`. The tuple includes immutable model and runtime
+manifest digests, physical device identity, effective precision, platform,
+fixture hashes, and capability outcomes. A material tuple change or elapsed
+expiry invalidates the row. Metadata, loading, or a device probe alone never
+produces `tested`, and a qualification record makes no model-quality claim.
+
 Consequently, the current single global model `status` should become an
 installation-integrity status plus per-runtime/device validation records. A
 CUDA out-of-memory error, unsupported MPS operation, or missing optional
 runtime must not mark the downloaded snapshot invalid. Only corruption,
 incomplete download, or hash failure invalidates the installation itself.
+
+Installation integrity is checked at the reusable `verify_installed_model`
+boundary before Transformers imports or loads the model. A versioned manifest
+records normalized paths, byte lengths, SHA-256 values, source repository and
+immutable revision, installation time, `trust_remote_code`, and an aggregate
+manifest digest. Results are `verified`, `missing`, `modified`,
+`unexpected_file`, `unsafe_remote_code`, and the typed legacy result
+`manifest_missing`. The model metadata and manifest are explicitly allowed
+outside the recorded artifact set; every other added file, including an
+unrecorded cache file, is denied. Cache files present at installation are part
+of the recorded artifact set.
+
+These hashes prove only byte equality with the recorded installation. They do
+not prove model safety, parser safety, absence of malicious behavior, semantic
+quality, device compatibility, or freedom from out-of-memory failures.
 
 ## Adapter eligibility
 
@@ -96,7 +118,8 @@ Static eligibility requires all of the following:
 `trust_remote_code` remains an explicit unsafe escape hatch. Such a model can
 be installed and run at the user's request, pinned to a commit, but stays
 `candidate/unsafe` and cannot enter Mun's tested catalog until its code is
-vendored or the model works through an upstream loader.
+vendored or the model works through an upstream loader. A matching artifact
+manifest does not make remote code tested or safe.
 
 ### faster-whisper/CTranslate2
 

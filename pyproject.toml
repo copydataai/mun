@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "mun"
 version = "0.1.0"
-description = "Local-first batch speech-to-text from Hugging Face models"
+description = "Private audio and video transcription on your computer"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 license = "Apache-2.0"
@@ -34,4 +34,4 @@ mun = "mun.cli:main"
 packages = ["src/mun"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/mun", "tests", "README.md", "LICENSE", "CONTEXT.md", "pyproject.toml"]
+include = ["src/mun", "tests", "docs", "fixtures", "README.md", "LICENSE", "CONTEXT.md", "pyproject.toml"]

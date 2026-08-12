@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import unittest
-import time
+import tempfile
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
 from mun.errors import MunError
 
 from mun.core import (
+    ExportCommitError,
     Segment,
     SourceMedia,
     Transcript,
@@ -19,9 +22,10 @@ from mun.core import (
     run_transcription_workflow,
     write_result_outputs,
 )
-from mun.models import InstalledModel
+from mun.models import InstalledModel, VerificationResult
 from mun.runtime import FakeSpeechRuntime
-from mun.transcript import make_batch_result
+from mun.artifacts import ArtifactValidationError
+from mun.transcript import TranscriptResult, make_batch_result
 
 
 class TranscriptContractTests(unittest.TestCase):
@@ -29,9 +33,15 @@ class TranscriptContractTests(unittest.TestCase):
         self.model = InstalledModel("example/model", "abc123", "/models/example", "2026-08-09T00:00:00+00:00")
         self.media = SourceMedia(Path("/private/source.wav"), Path("batch/source.wav"))
         self.runtime = FakeSpeechRuntime(Transcript("Hello world", [Segment("Hello", 0.0, 1.25)], "en"))
+        self.runtime.model_artifact_sha256 = "a" * 64
+        self.runtime.test_installed_model = self.model
 
     def test_workflow_returns_canonical_result(self) -> None:
-        result = run_transcription_workflow([self.media], self.model, TranscriptionOptions(), runtime=self.runtime)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source.wav"
+            source.write_bytes(b"canonical source bytes")
+            media = SourceMedia(source, Path("batch/source.wav"))
+            result = run_transcription_workflow([media], self.model, TranscriptionOptions(), runtime=self.runtime)[0]
         payload = result.to_dict()
 
         self.assertEqual(payload["schema_version"], 1)
@@ -40,16 +50,96 @@ class TranscriptContractTests(unittest.TestCase):
         self.assertNotIn("/private", json.dumps(payload))
         self.assertEqual(payload["transcripts"][0]["segments"][0]["start_ms"], 0)
         self.assertEqual(payload["provenance"]["runtime"]["name"], "test")
-        self.assertIsNone(payload["source"]["sha256"])
+        self.assertEqual(payload["source"]["sha256"], hashlib.sha256(b"canonical source bytes").hexdigest())
         self.assertIn("precision", payload["provenance"])
+        self.assertRegex(payload["result_digest"], r"^[0-9a-f]{64}$")
+        self.assertEqual(payload["trust"]["media"], "untrusted_bytes")
+        self.assertEqual(payload["trust"]["model"], "verified_artifact")
+        self.assertEqual(payload["trust"]["content"], "untrusted_model_output")
+        self.assertEqual(payload["agent_eligibility"]["status"], "ineligible")
+
+    def test_corrected_result_remains_tainted_with_review_metadata(self) -> None:
+        from tests.test_review import correction_payload, machine_result
+        from mun.review import CorrectionSet, apply_corrections
+
+        machine = machine_result()
+        corrections = CorrectionSet.from_json(json.dumps(correction_payload(machine)))
+        corrected = apply_corrections(machine, corrections).transcript.to_dict()
+
+        self.assertEqual(corrected["trust"]["content"], "untrusted_content")
+        self.assertEqual(corrected["trust"]["review"]["state"], corrections.review_state)
+        self.assertEqual(corrected["trust"]["review"]["correction_set_id"], corrections.correction_set_id)
+        self.assertEqual(corrected["agent_eligibility"]["status"], "ineligible")
+
+    def test_json_loader_validates_claimed_result_digest(self) -> None:
+        result = run_transcription_workflow([self.media], self.model, TranscriptionOptions(), runtime=self.runtime)[0]
+        payload = json.loads(result.to_json())
+        payload["transcripts"][0]["text"] = "tampered"
+
+        with self.assertRaises(ArtifactValidationError):
+            TranscriptResult.from_json(json.dumps(payload))
+
+    def test_json_loader_accepts_legacy_result_without_digest(self) -> None:
+        result = run_transcription_workflow([self.media], self.model, TranscriptionOptions(), runtime=self.runtime)[0]
+        payload = result.to_dict()
+        payload.pop("result_digest")
+
+        loaded = TranscriptResult.from_json(json.dumps(payload))
+
+        self.assertIsNone(loaded.result_digest)
+        self.assertEqual(loaded.transcripts[0].text, "Hello world")
+
+    def test_source_digest_depends_on_bytes_not_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            first = Path(temporary) / "first.wav"
+            second = Path(temporary) / "renamed.wav"
+            first.write_bytes(b"same bytes")
+            second.write_bytes(b"same bytes")
+            results = run_transcription_workflow(
+                [SourceMedia(first, Path("first.wav")), SourceMedia(second, Path("renamed.wav"))],
+                self.model,
+                TranscriptionOptions(),
+                runtime=self.runtime,
+            )
+
+        self.assertEqual(results[0].source.sha256, results[1].source.sha256)
+
+    def test_operation_records_every_inference_affecting_option(self) -> None:
+        options = TranscriptionOptions(
+            language="es", timestamps=True, translate=True, chunk_length=42, stride_length=7, device="mps"
+        )
+        result = run_transcription_workflow([self.media], self.model, options, runtime=self.runtime)[0]
+        payload = result.to_dict()
+
+        self.assertEqual(
+            payload["operation"]["parameters"],
+            {
+                "language": "es",
+                "timestamps": True,
+                "translate": True,
+                "chunk_length": 42,
+                "stride_length": 7,
+                "requested_device": "mps",
+                "effective_device": "cpu",
+                "precision": "test",
+            },
+        )
+        self.assertEqual(payload["operation"]["source_hash_policy"], "sha256_source_bytes")
+        self.assertIn("environment", payload["provenance"]["runtime"])
 
     def test_json_txt_srt_vtt_are_deterministic_projections(self) -> None:
         result = run_transcription_workflow([self.media], self.model, TranscriptionOptions(), runtime=self.runtime)[0]
 
         self.assertEqual(render_output("txt", result, self.media, self.model, "cpu"), "Hello world\n")
         self.assertIn('"transcripts"', render_output("json", result, self.media, self.model, "cpu"))
-        self.assertIn("00:00:00,000 --> 00:00:01,250", render_output("srt", result, self.media, self.model, "cpu"))
-        self.assertTrue(render_output("vtt", result, self.media, self.model, "cpu").startswith("WEBVTT\n"))
+        self.assertEqual(
+            render_output("srt", result, self.media, self.model, "cpu"),
+            "1\n00:00:00,000 --> 00:00:01,250\nHello\n",
+        )
+        self.assertEqual(
+            render_output("vtt", result, self.media, self.model, "cpu"),
+            "WEBVTT\n\n00:00:00.000 --> 00:00:01.250\nHello\n",
+        )
 
     def test_batch_result_contains_ordered_records_and_counts(self) -> None:
         results = run_transcription_workflow([self.media, SourceMedia(Path("/x/second.wav"), Path("second.wav"))], self.model, TranscriptionOptions(), runtime=self.runtime)
@@ -57,12 +147,16 @@ class TranscriptContractTests(unittest.TestCase):
 
         self.assertEqual([item["source"]["relative_path"] for item in batch["files"]], ["batch/source.wav", "second.wav"])
         self.assertEqual(batch["counts"]["completed"], 2)
+        self.assertEqual(batch["counts"]["processed"], 2)
+        self.assertEqual(batch["counts"]["reused_verified"], 0)
 
     def test_translation_writes_one_canonical_json_and_variant_text_files(self) -> None:
         runtime = FakeSpeechRuntime(
             Transcript("Hola", [Segment("Hola", 0.0, 1.0)], "es"),
             Transcript("Hello", [Segment("Hello", 0.0, 1.0)], "en"),
         )
+        runtime.model_artifact_sha256 = "a" * 64
+        runtime.test_installed_model = self.model
         result = run_transcription_workflow(
             [self.media], self.model, TranscriptionOptions(translate=True), runtime=runtime
         )[0]
@@ -85,6 +179,68 @@ class TranscriptContractTests(unittest.TestCase):
                     [Path(f"{base}.json"), Path(f"{base}.original.txt"), Path(f"{base}.en.txt")],
                 )
 
+    def test_render_failure_leaves_no_final_projection_and_records_failed_before_commit(self) -> None:
+        result = run_transcription_workflow([self.media], self.model, TranscriptionOptions(), runtime=self.runtime)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary) / "source"
+
+            def fail_txt_render(format_name, *args):
+                if format_name == "txt":
+                    raise MunError("cannot render")
+                return render_output(format_name, *args)
+
+            with patch("mun.core.render_output", side_effect=fail_txt_render):
+                with self.assertRaises(MunError):
+                    write_result_outputs(base, ["txt", "json"], result, translated=False, overwrite=False)
+
+            receipt = json.loads(Path(f"{base}.receipt.json").read_text(encoding="utf-8"))
+            self.assertEqual(receipt["state"], "failed_before_commit")
+            self.assertEqual(receipt["committed_paths"], [])
+            self.assertEqual(receipt["uncommitted_paths"], [str(Path(f"{base}.json")), str(Path(f"{base}.txt"))])
+            self.assertFalse(Path(f"{base}.txt").exists())
+            self.assertFalse(Path(f"{base}.json").exists())
+            self.assertEqual(list(Path(temporary).glob(".mun-stage-*")), [])
+
+    def test_commit_failure_reports_exact_partial_commit_paths(self) -> None:
+        result = run_transcription_workflow([self.media], self.model, TranscriptionOptions(), runtime=self.runtime)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary) / "source"
+            real_replace = Path.replace
+            destinations = [Path(f"{base}.json"), Path(f"{base}.txt")]
+
+            def fail_second_commit(path: Path, target: Path):
+                if target == destinations[1]:
+                    raise OSError("disk failure")
+                return real_replace(path, target)
+
+            with patch.object(Path, "replace", autospec=True, side_effect=fail_second_commit):
+                with self.assertRaises(ExportCommitError) as caught:
+                    write_result_outputs(base, ["txt", "json"], result, translated=False, overwrite=False)
+
+            self.assertEqual(caught.exception.committed_paths, [destinations[0]])
+            self.assertEqual(caught.exception.uncommitted_paths, [destinations[1]])
+            receipt = json.loads(Path(f"{base}.receipt.json").read_text(encoding="utf-8"))
+            self.assertEqual(receipt["state"], "partial_commit")
+            self.assertEqual(receipt["committed_paths"], [str(destinations[0])])
+            self.assertEqual(receipt["uncommitted_paths"], [str(destinations[1])])
+            self.assertTrue(destinations[0].exists())
+            self.assertFalse(destinations[1].exists())
+            self.assertEqual(list(Path(temporary).glob(".mun-stage-*")), [])
+
+    def test_precommit_cancellation_writes_cancelled_receipt_without_final_paths(self) -> None:
+        result = run_transcription_workflow([self.media], self.model, TranscriptionOptions(), runtime=self.runtime)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary) / "source"
+            with patch("mun.core.render_output", side_effect=KeyboardInterrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    write_result_outputs(base, ["txt"], result, translated=False, overwrite=False)
+
+            receipt = json.loads(Path(f"{base}.receipt.json").read_text(encoding="utf-8"))
+            self.assertEqual(receipt["state"], "cancelled")
+            self.assertEqual(receipt["committed_paths"], [])
+            self.assertFalse(Path(f"{base}.txt").exists())
+            self.assertEqual(list(Path(temporary).glob(".mun-stage-*")), [])
+
     def test_failed_result_does_not_expose_exception_details(self) -> None:
         class FailingRuntime:
             info = self.runtime.info
@@ -98,6 +254,8 @@ class TranscriptContractTests(unittest.TestCase):
 
         payload = json.dumps(result.to_dict())
         self.assertEqual(result.status, "failed")
+        self.assertIn('"operation"', payload)
+        self.assertIn('"parameters"', payload)
         self.assertNotIn("secret", payload)
         self.assertNotIn("/Users/private", payload)
 
@@ -165,13 +323,200 @@ class TranscriptContractTests(unittest.TestCase):
             self.assertEqual(summaries[0].status, "failed")
             self.assertFalse(any("private/source.wav" in failure["error"] for failure in failures))
 
-    def test_run_batch_parallel_skips_without_loading_model(self) -> None:
+    def test_run_batch_reports_a_failed_source_as_failed(self) -> None:
         import tempfile
+
+        class FailingRuntime:
+            info = self.runtime.info
+
+            def transcribe(self, source, options):
+                raise RuntimeError("broken media")
 
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary) / "file.wav"
             source.write_bytes(b"audio")
-            (Path(temporary) / "file.txt").write_text("cached", encoding="utf-8")
+            progress: list[str] = []
+            run_batch(
+                [SourceMedia(source, Path(source.name))],
+                self.model,
+                Path(temporary),
+                ["txt"],
+                TranscriptionOptions(),
+                False,
+                progress.append,
+                runtime=FailingRuntime(),
+            )
+
+        self.assertTrue(any("] failed " in message for message in progress), progress)
+        self.assertFalse(any("] complete " in message for message in progress), progress)
+
+    def test_serial_batch_cancellation_persists_completed_active_and_queued_outcomes(self) -> None:
+        runtime = self.runtime
+
+        class InterruptingRuntime:
+            info = runtime.info
+            model_artifact_sha256 = runtime.model_artifact_sha256
+            test_installed_model = runtime.test_installed_model
+
+            def transcribe(self, source, options):
+                if source.name == "two.wav":
+                    raise KeyboardInterrupt
+                return runtime.transcribe(source, options)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            media = []
+            for name in ("one.wav", "two.wav", "three.wav"):
+                source = root / name
+                source.write_bytes(name.encode("ascii"))
+                media.append(SourceMedia(source, Path(name)))
+
+            with self.assertRaises(KeyboardInterrupt):
+                run_batch(
+                    media,
+                    self.model,
+                    root / "out",
+                    ["json"],
+                    TranscriptionOptions(),
+                    False,
+                    lambda _: None,
+                    runtime=InterruptingRuntime(),
+                )
+
+            receipt = json.loads((root / "out" / "mun-batch-interruption.json").read_text(encoding="utf-8"))
+            self.assertTrue((root / "out" / "one.json").is_file())
+
+        self.assertEqual(receipt["status"], "cancelled")
+        self.assertEqual([item["status"] for item in receipt["files"]], ["completed", "cancelled"])
+        self.assertEqual(receipt["counts"]["cancelled"], 1)
+        self.assertEqual(receipt["files"][1]["diagnostics"][0]["code"], "batch_cancelled")
+        self.assertEqual(receipt["files"][1]["source"]["relative_path"], "two.wav")
+        self.assertEqual(receipt["queued_unstarted_sources"], [{"name": "three.wav", "relative_path": "three.wav"}])
+        self.assertNotIn(temporary, json.dumps(receipt))
+
+    def test_parallel_batch_cancellation_flushes_completed_output_and_bounded_receipt(self) -> None:
+        completed_result = run_transcription_workflow(
+            [SourceMedia(Path("/private/one.wav"), Path("one.wav"))],
+            self.model,
+            TranscriptionOptions(device="cpu"),
+            runtime=self.runtime,
+        )[0]
+
+        class Future:
+            def __init__(self, index):
+                self.index = index
+
+            def result(self):
+                return self.index, completed_result
+
+            def cancel(self):
+                return self.index == 2
+
+        class Executor:
+            def __init__(self, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def submit(self, function, payload):
+                return Future(payload[0])
+
+            def shutdown(self, wait=True, cancel_futures=False):
+                pass
+
+        def interrupted_completion(futures):
+            ordered = list(futures)
+            yield ordered[0]
+            raise KeyboardInterrupt
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            media = []
+            for name, size in (("one.wav", 30), ("two.wav", 20), ("three.wav", 10)):
+                source = root / name
+                source.write_bytes(b"x" * size)
+                media.append(SourceMedia(source, Path(name)))
+
+            with patch("mun.core.ProcessPoolExecutor", Executor), patch(
+                "mun.core.as_completed", interrupted_completion
+            ), self.assertRaises(KeyboardInterrupt):
+                run_batch(
+                    media,
+                    self.model,
+                    root / "out",
+                    ["json"],
+                    TranscriptionOptions(device="cpu"),
+                    False,
+                    lambda _: None,
+                    jobs=2,
+                )
+
+            receipt = json.loads((root / "out" / "mun-batch-interruption.json").read_text(encoding="utf-8"))
+            self.assertTrue((root / "out" / "one.json").is_file())
+
+        self.assertEqual(
+            [item["status"] for item in receipt["files"]],
+            ["completed", "cancelled"],
+        )
+        self.assertEqual(receipt["counts"]["cancelled"], 1)
+        self.assertEqual(receipt["files"][1]["source"]["relative_path"], "two.wav")
+        self.assertEqual(receipt["queued_unstarted_sources"], [])
+        self.assertEqual(
+            receipt["unfinished_unknown_sources"],
+            [{"name": "three.wav", "relative_path": "three.wav"}],
+        )
+        self.assertNotIn("three.wav", [item["source"]["relative_path"] for item in receipt["files"]])
+
+    def test_completed_result_requires_runtime_artifact_binding(self) -> None:
+        runtime = FakeSpeechRuntime(Transcript("Hello", [], "en"))
+        runtime.test_installed_model = self.model
+
+        result = run_transcription_workflow(
+            [self.media], self.model, TranscriptionOptions(), runtime=runtime
+        )[0]
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.diagnostics[0].code, "model_artifact_binding_failed")
+
+    def test_completed_result_rejects_mismatched_test_model_binding(self) -> None:
+        runtime = FakeSpeechRuntime(Transcript("Hello", [], "en"))
+        runtime.model_artifact_sha256 = "a" * 64
+        runtime.test_installed_model = InstalledModel(
+            "other/model", "abc123", "/models/other", "2026-08-09T00:00:00+00:00"
+        )
+
+        result = run_transcription_workflow(
+            [self.media], self.model, TranscriptionOptions(), runtime=runtime
+        )[0]
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.diagnostics[0].code, "model_artifact_binding_failed")
+
+    def test_completed_result_rejects_digest_mismatched_with_installed_model(self) -> None:
+        runtime = FakeSpeechRuntime(Transcript("Hello", [], "en"))
+        runtime.info = replace(runtime.info, name="transformers")
+        runtime.model_artifact_sha256 = "a" * 64
+
+        with patch(
+            "mun.core.verify_installed_model",
+            return_value=VerificationResult("verified", "b" * 64),
+        ):
+            result = run_transcription_workflow(
+                [self.media], self.model, TranscriptionOptions(), runtime=runtime
+            )[0]
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.diagnostics[0].code, "model_artifact_binding_failed")
+
+    def test_unrelated_txt_blocks_without_fabricating_transcript_content(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "file.wav"
+            source.write_bytes(b"audio")
+            (Path(temporary) / "file.txt").write_text("unrelated", encoding="utf-8")
             media = [SourceMedia(source, Path(source.name))]
             with patch("mun.core.load_pipeline") as load_pipeline:
                 summaries, failures = run_batch(
@@ -186,41 +531,161 @@ class TranscriptContractTests(unittest.TestCase):
                 )
             self.assertEqual(load_pipeline.call_count, 0)
             self.assertEqual(summaries[0].status, "partial")
-            self.assertEqual(failures, [])
+            self.assertEqual(summaries[0].reuse_status, "conflict")
+            self.assertEqual(summaries[0].transcripts, [])
+            self.assertEqual(failures[0]["error"], "Existing outputs cannot be verified for reuse")
 
-    def test_run_batch_parallel_skips_fast_path_is_not_inflated_by_runtime_setup(self) -> None:
-        import tempfile
-
+    def test_matching_canonical_json_is_reused_without_loading_model(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            media = []
-            for index in range(20):
-                source = Path(temporary) / f"file-{index}.wav"
-                source.write_bytes(b"audio")
-                (Path(temporary) / f"file-{index}.txt").write_text("cached", encoding="utf-8")
-                media.append(SourceMedia(source, Path(source.name)))
-
-            def blocking_load_pipeline(*_args, **_kwargs):
-                time.sleep(0.05)
-                raise RuntimeError("runtime load should be skipped")
-
-            start = time.perf_counter()
-            with patch("mun.core.load_pipeline", side_effect=blocking_load_pipeline) as load_pipeline:
+            source = Path(temporary) / "file.wav"
+            source.write_bytes(b"audio")
+            media = SourceMedia(source, Path(source.name))
+            canonical = run_transcription_workflow(
+                [media], self.model, TranscriptionOptions(), runtime=self.runtime
+            )[0]
+            (Path(temporary) / "file.json").write_text(canonical.to_json(), encoding="utf-8")
+            with patch("mun.core.verify_installed_model", return_value=VerificationResult("verified", "a" * 64)), \
+                patch("mun.core.load_pipeline") as load_pipeline:
                 summaries, failures = run_batch(
-                    media,
+                    [media],
                     self.model,
                     Path(temporary),
-                    ["txt"],
+                    ["json"],
                     TranscriptionOptions(),
                     False,
                     lambda _: None,
+                    runtime=self.runtime,
                     jobs=4,
                 )
-            elapsed = time.perf_counter() - start
-
             self.assertEqual(load_pipeline.call_count, 0)
-            self.assertLess(elapsed, 0.20)
-            self.assertEqual([item.status for item in summaries], ["partial"] * len(media))
+            self.assertEqual(summaries[0].status, "completed")
+            self.assertEqual(summaries[0].reuse_status, "reused_verified")
+            self.assertEqual(summaries[0].transcripts[0].text, "Hello world")
             self.assertEqual(failures, [])
+
+    def test_same_repository_and_revision_with_changed_artifact_rejects_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "file.wav"
+            source.write_bytes(b"audio")
+            media = SourceMedia(source, Path(source.name))
+            canonical = run_transcription_workflow(
+                [media], self.model, TranscriptionOptions(), runtime=self.runtime
+            )[0]
+            (Path(temporary) / "file.json").write_text(canonical.to_json(), encoding="utf-8")
+
+            with patch("mun.core.verify_installed_model", return_value=VerificationResult("verified", "b" * 64)):
+                summaries, failures = run_batch(
+                    [media], self.model, Path(temporary), ["json"], TranscriptionOptions(), False,
+                    lambda _: None, runtime=self.runtime,
+                )
+
+        self.assertEqual(summaries[0].reuse_status, "conflict")
+        self.assertEqual(len(failures), 1)
+
+    def test_runtime_tuple_mismatch_rejects_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "file.wav"
+            source.write_bytes(b"audio")
+            media = SourceMedia(source, Path(source.name))
+            canonical = run_transcription_workflow(
+                [media], self.model, TranscriptionOptions(), runtime=self.runtime
+            )[0]
+            (Path(temporary) / "file.json").write_text(canonical.to_json(), encoding="utf-8")
+            changed_runtime = FakeSpeechRuntime(Transcript("unused", [], "en"))
+            changed_runtime.info = replace(changed_runtime.info, version="changed-runtime")
+            changed_runtime.model_artifact_sha256 = "a" * 64
+
+            with patch("mun.core.verify_installed_model", return_value=VerificationResult("verified", "a" * 64)):
+                summaries, failures = run_batch(
+                    [media], self.model, Path(temporary), ["json"], TranscriptionOptions(), False,
+                    lambda _: None, runtime=changed_runtime,
+                )
+
+        self.assertEqual(summaries[0].reuse_status, "conflict")
+        self.assertEqual(len(failures), 1)
+
+    def test_missing_runtime_artifact_identity_rejects_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "file.wav"
+            source.write_bytes(b"audio")
+            media = SourceMedia(source, Path(source.name))
+            canonical = run_transcription_workflow(
+                [media], self.model, TranscriptionOptions(), runtime=self.runtime
+            )[0]
+            (Path(temporary) / "file.json").write_text(canonical.to_json(), encoding="utf-8")
+            unbound_runtime = FakeSpeechRuntime(Transcript("unused", [], "en"))
+
+            with patch("mun.core.verify_installed_model", return_value=VerificationResult("verified", "a" * 64)):
+                summaries, failures = run_batch(
+                    [media], self.model, Path(temporary), ["json"], TranscriptionOptions(), False,
+                    lambda _: None, runtime=unbound_runtime,
+                )
+
+        self.assertEqual(summaries[0].reuse_status, "conflict")
+        self.assertEqual(len(failures), 1)
+
+    def test_changed_source_or_parameters_reject_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "file.wav"
+            source.write_bytes(b"original")
+            media = SourceMedia(source, Path(source.name))
+            canonical = run_transcription_workflow(
+                [media], self.model, TranscriptionOptions(), runtime=self.runtime
+            )[0]
+            (Path(temporary) / "file.json").write_text(canonical.to_json(), encoding="utf-8")
+
+            source.write_bytes(b"changed")
+            source_results, source_failures = run_batch(
+                [media], self.model, Path(temporary), ["json"], TranscriptionOptions(), False,
+                lambda _: None, jobs=4,
+            )
+            source.write_bytes(b"original")
+            option_results, option_failures = run_batch(
+                [media], self.model, Path(temporary), ["json"], TranscriptionOptions(language="es"), False,
+                lambda _: None, jobs=4,
+            )
+
+        self.assertEqual(source_results[0].reuse_status, "conflict")
+        self.assertEqual(option_results[0].reuse_status, "conflict")
+        self.assertEqual(len(source_failures), 1)
+        self.assertEqual(len(option_failures), 1)
+
+    def test_partial_projection_set_is_distinct_from_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "file.wav"
+            source.write_bytes(b"audio")
+            media = SourceMedia(source, Path(source.name))
+            canonical = run_transcription_workflow(
+                [media], self.model, TranscriptionOptions(), runtime=self.runtime
+            )[0]
+            (Path(temporary) / "file.json").write_text(canonical.to_json(), encoding="utf-8")
+
+            summaries, failures = run_batch(
+                [media], self.model, Path(temporary), ["json", "txt"], TranscriptionOptions(), False,
+                lambda _: None, jobs=4,
+            )
+
+        self.assertEqual(summaries[0].reuse_status, "incomplete_output_set")
+        self.assertEqual(len(failures), 1)
+
+    def test_overwrite_replaces_only_requested_output_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "file.wav"
+            source.write_bytes(b"audio")
+            txt = Path(temporary) / "file.txt"
+            json_path = Path(temporary) / "file.json"
+            txt.write_text("old", encoding="utf-8")
+            json_path.write_text("keep", encoding="utf-8")
+
+            summaries, failures = run_batch(
+                [SourceMedia(source, Path(source.name))], self.model, Path(temporary), ["txt"],
+                TranscriptionOptions(), True, lambda _: None, runtime=self.runtime,
+            )
+
+            self.assertEqual(txt.read_text(encoding="utf-8"), "Hello world\n")
+            self.assertEqual(json_path.read_text(encoding="utf-8"), "keep")
+        self.assertEqual(summaries[0].reuse_status, "overwrite_required")
+        self.assertEqual(failures, [])
 
 
 if __name__ == "__main__":

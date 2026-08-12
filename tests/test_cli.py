@@ -1,20 +1,218 @@
 from __future__ import annotations
 
+import argparse
 import contextlib
+import hashlib
 import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from mun.cli import _existing_ancestor, build_parser, command_transcribe, main
+from mun.cli import _existing_ancestor, build_parser, command_transcribe, interactive_wizard, main
 from mun.core import SourceMedia
-from mun.models import InstalledModel
+from mun.models import InstalledModel, _write_metadata
 from mun.transcript import SourceRecord, TranscriptResult, make_provenance
 
 
 class CliTests(unittest.TestCase):
+    def assert_private_home_absent(self, value: str) -> None:
+        self.assertNotIn(str(Path.home()), value)
+        self.assertNotIn(Path.home().name, value)
+
+    def test_model_removal_cli_redacts_home_paths_in_receipt(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            root = Path(temporary) / "models"
+            target = root / "owner--model--abc"
+            target.mkdir(parents=True)
+            model = InstalledModel("owner/model", "abc", str(target), "2026-08-12T00:00:00Z")
+            _write_metadata(target, model)
+            output = io.StringIO()
+
+            with patch("mun.cli.load_config", return_value={}), contextlib.redirect_stdout(output):
+                status = main(["models", "--model-dir", str(root), "remove", "owner/model", "--yes"])
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(status, 0)
+        self.assertEqual(payload["attempted_paths"], ["owner--model--abc"])
+        self.assertEqual(payload["removed_model"]["path"], "owner--model--abc")
+        self.assert_private_home_absent(output.getvalue())
+
+    def test_model_removal_cli_redacts_home_paths_in_error_diagnostics(self) -> None:
+        missing = Path.home() / "private-owner" / "missing-model"
+        errors = io.StringIO()
+
+        with patch("mun.cli.load_config", return_value={}), contextlib.redirect_stderr(errors):
+            status = main(["models", "--model-dir", str(missing.parent), "remove", str(missing), "--yes"])
+
+        self.assertEqual(status, 1)
+        self.assertIn("No installed model", errors.getvalue())
+        self.assertIn("~/private-owner/missing-model", errors.getvalue())
+        self.assert_private_home_absent(errors.getvalue())
+
+    def test_review_commands_parse_narrow_apply_and_render_operations(self) -> None:
+        apply_args = build_parser().parse_args(
+            ["review", "apply", "machine.json", "corrections.json", "-o", "corrected.json"]
+        )
+        render_args = build_parser().parse_args(
+            ["review", "render", "machine.json", "--corrections", "corrections.json", "--view", "corrected", "--format", "srt"]
+        )
+
+        self.assertEqual(apply_args.review_command, "apply")
+        self.assertEqual(apply_args.output, Path("corrected.json"))
+        self.assertEqual(render_args.review_command, "render")
+        self.assertEqual(render_args.view, "corrected")
+        self.assertEqual(render_args.format, "srt")
+
+    def test_remote_code_download_parses_explicit_acknowledgement(self) -> None:
+        args = build_parser().parse_args([
+            "models", "download", "owner/model", "--trust-remote-code", "--acknowledge-remote-code"
+        ])
+
+        self.assertTrue(args.trust_remote_code)
+        self.assertTrue(args.acknowledge_remote_code)
+
+    def test_review_apply_and_render_do_not_rewrite_machine_json(self) -> None:
+        from tests.test_review import correction_payload, machine_result
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            machine = root / "machine.json"
+            corrections = root / "corrections.json"
+            corrected = root / "corrected.json"
+            result = machine_result()
+            machine.write_text(result.to_json(), encoding="utf-8")
+            original_bytes = machine.read_bytes()
+            corrections.write_text(json.dumps(correction_payload(result)), encoding="utf-8")
+
+            self.assertEqual(main(["review", "apply", str(machine), str(corrections), "-o", str(corrected)]), 0)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                status = main(
+                    ["review", "render", str(machine), "--corrections", str(corrections), "--view", "corrected", "--format", "txt"]
+                )
+
+            self.assertEqual(status, 0)
+            self.assertEqual(output.getvalue(), "Hello world. Next line.\n")
+            self.assertEqual(machine.read_bytes(), original_bytes)
+            self.assertEqual(json.loads(corrected.read_text(encoding="utf-8"))["review_state"], "reviewed")
+
+    def test_corrected_projection_writes_adjacent_identity_receipt(self) -> None:
+        from tests.test_review import correction_payload, machine_result
+        from mun.review import CorrectionSet
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            machine = root / "machine.json"
+            corrections = root / "corrections.json"
+            result = machine_result()
+            machine.write_text(result.to_json(), encoding="utf-8")
+            correction_json = json.dumps(correction_payload(result))
+            corrections.write_text(correction_json, encoding="utf-8")
+            correction_digest = CorrectionSet.from_json(correction_json).digest
+            expected_by_format = {
+                "txt": b"Hello world. Next line.\n",
+                "srt": (
+                    "1\n00:00:00,000 --> 00:00:01,250\nHello world.\n\n"
+                    "2\n00:00:01,250 --> 00:00:02,400\nNext line.\n"
+                ).encode(),
+                "vtt": (
+                    "WEBVTT\n\n00:00:00.000 --> 00:00:01.250\nHello world.\n\n"
+                    "00:00:01.250 --> 00:00:02.400\nNext line.\n"
+                ).encode(),
+            }
+
+            for format_name, expected in expected_by_format.items():
+                with self.subTest(format=format_name):
+                    output = root / f"reviewed.{format_name}"
+                    status = main([
+                        "review", "render", str(machine), "--corrections", str(corrections),
+                        "--view", "corrected", "--format", format_name, "--output", str(output),
+                    ])
+
+                    receipt = json.loads(Path(f"{output}.receipt.json").read_text(encoding="utf-8"))
+                    self.assertEqual(status, 0)
+                    self.assertEqual(output.read_bytes(), expected)
+                    self.assertEqual(receipt["view"], "corrected")
+                    self.assertEqual(receipt["review_state"], "reviewed")
+                    self.assertEqual(receipt["parent_result_digest"], result.result_digest)
+                    self.assertEqual(receipt["correction_set_id"], "review-2026-08-12-a")
+                    self.assertEqual(receipt["correction_set_digest"], correction_digest)
+                    self.assertEqual(
+                        receipt["renderer_parameters"],
+                        {"format": format_name, "encoding": "utf-8", "newline": "lf"},
+                    )
+                    self.assertEqual(receipt["output_byte_digest"], hashlib.sha256(expected).hexdigest())
+                    self.assertEqual(receipt["output_path"], {"name": f"reviewed.{format_name}"})
+
+    def test_guided_workflow_uses_an_installed_model_without_downloading_again(self) -> None:
+        model = InstalledModel(
+            "owner/model",
+            "abc123",
+            "/models/owner--model",
+            "2026-08-11T00:00:00+00:00",
+            status="installed",
+        )
+        captured: list[argparse.Namespace] = []
+
+        def fake_transcribe(args: argparse.Namespace) -> int:
+            captured.append(args)
+            return 0
+
+        with patch("mun.cli.load_config", return_value={}), \
+            patch("mun.cli.models_root", return_value=Path("/models")), \
+            patch("mun.cli.installed_models", return_value=[model]), \
+            patch("mun.cli.download_model") as download, \
+            patch("builtins.input", side_effect=["", "voice.wav", ""]), \
+            patch("mun.cli.command_transcribe", side_effect=fake_transcribe):
+            status = interactive_wizard()
+
+        self.assertEqual(status, 0)
+        download.assert_not_called()
+        self.assertEqual(captured[0].model, "/models/owner--model")
+        self.assertFalse(captured[0].benchmark)
+
+    def test_guided_workflow_uses_a_model_immediately_after_download(self) -> None:
+        model = InstalledModel(
+            "owner/model",
+            "abc123",
+            "/models/owner--model",
+            "2026-08-11T00:00:00+00:00",
+            status="installed",
+        )
+        captured: list[argparse.Namespace] = []
+
+        def fake_transcribe(args: argparse.Namespace) -> int:
+            captured.append(args)
+            return 0
+
+        with patch("mun.cli.load_config", return_value={}), \
+            patch("mun.cli.models_root", return_value=Path("/models")), \
+            patch("mun.cli.installed_models", side_effect=[[], [model]]), \
+            patch("mun.cli.load_catalog", return_value={"models": [{
+                "id": "owner/model",
+                "revision": "abc123",
+                "weights_bytes": 1024,
+                "license": "apache-2.0",
+            }]}), \
+            patch("mun.cli._confirm", return_value=True), \
+            patch("mun.cli.download_model", return_value=model) as download, \
+            patch("builtins.input", side_effect=["", "voice.wav", ""]), \
+            patch("mun.cli.command_transcribe", side_effect=fake_transcribe):
+            status = interactive_wizard()
+
+        self.assertEqual(status, 0)
+        download.assert_called_once_with("owner/model", Path("/models"), "abc123", False, False)
+        self.assertEqual(captured[0].model, "/models/owner--model")
+
+    def test_help_describes_the_product_and_common_workflow(self) -> None:
+        help_text = build_parser().format_help()
+
+        self.assertIn("Transcribe audio and video on your computer", help_text)
+        self.assertIn("mun transcribe recordings/", help_text)
+
     def test_transcribe_defaults_parse(self) -> None:
         args = build_parser().parse_args(["transcribe", "voice.wav"])
         self.assertEqual(args.inputs, ["voice.wav"])
@@ -112,6 +310,61 @@ class CliTests(unittest.TestCase):
             self.assertEqual(batch_requests[0]["media_count"], 2)
             self.assertEqual(batch_requests[0]["jobs"], 1)
             self.assertEqual(batch_requests[0]["formats"], ["txt"])
+
+    def test_verified_reuse_succeeds_and_is_counted_separately(self) -> None:
+        result = TranscriptResult(
+            schema_version=1,
+            status="completed",
+            source=SourceRecord("one.wav", "one.wav"),
+            transcripts=[],
+            speakers=[],
+            diagnostics=[],
+            provenance=make_provenance(
+                mun_version="0.1.0",
+                model_id="owner/model",
+                revision="abc123",
+                runtime_name="transformers",
+                runtime_version="0",
+                requested_device="cpu",
+                effective_device="cpu",
+                precision="float32",
+            ),
+            reuse_status="reused_verified",
+        )
+        model = InstalledModel("owner/model", "abc123", "/models/model", "2026-08-11T00:00:00+00:00")
+        args = build_parser().parse_args(["transcribe", "one.wav", "--summary-json", "--benchmark"])
+        output = io.StringIO()
+        error = io.StringIO()
+
+        with patch("mun.cli.load_config", return_value={}), \
+            patch("mun.cli.discover_media", return_value=[SourceMedia(Path("one.wav"), Path("one.wav"))]), \
+            patch("mun.cli.models_root", return_value=Path("/models")), \
+            patch("mun.cli.find_installed", return_value=model), \
+            patch("mun.cli.load_pipeline", return_value=(SimpleNamespace(info=SimpleNamespace(effective_device="cpu")), "cpu", "transformers")), \
+            patch("mun.cli.run_batch", return_value=([result], [])), \
+            contextlib.redirect_stdout(output), contextlib.redirect_stderr(error):
+            status = command_transcribe(args)
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(status, 0)
+        self.assertEqual(payload["counts"]["processed"], 0)
+        self.assertEqual(payload["counts"]["reused_verified"], 1)
+        self.assertIn("processed=0 reused_verified=1", error.getvalue())
+
+    def test_keyboard_interrupt_at_transcription_workflow_boundary_is_cancelled_and_nonzero(self) -> None:
+        model = InstalledModel("owner/model", "abc123", "/models/model", "2026-08-11T00:00:00+00:00")
+        args = build_parser().parse_args(["transcribe", "one.wav"])
+
+        with patch("mun.cli.load_config", return_value={}), \
+            patch("mun.cli.discover_media", return_value=[SourceMedia(Path("one.wav"), Path("one.wav"))]), \
+            patch("mun.cli.models_root", return_value=Path("/models")), \
+            patch("mun.cli.find_installed", return_value=model), \
+            patch("mun.cli.load_pipeline", return_value=(SimpleNamespace(info=SimpleNamespace(effective_device="cpu")), "cpu", "transformers")), \
+            patch("mun.cli.run_batch", side_effect=KeyboardInterrupt), \
+            contextlib.redirect_stderr(io.StringIO()):
+            status = command_transcribe(args)
+
+        self.assertEqual(status, 1)
 
 
 if __name__ == "__main__":

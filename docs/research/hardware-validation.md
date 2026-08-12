@@ -85,6 +85,15 @@ The first passing record establishes, rather than compares against, the performa
 
 The validator emits one versioned JSON record per tuple and a short Markdown table generated from those records. JSON is the source of truth and contains raw samples, medians, hashes, environment fields, diagnostics, and a `tested`, `failed`, or `eligible` outcome. Secrets, usernames, home paths, and unrelated device inventory are excluded.
 
+The implemented local harness is `mun qualify MANIFEST -o RECORD`. It hashes
+fixture bytes, derives cold/warm medians and RTF, binds the machine, runtime,
+model, device, precision, capability, and memory evidence, and emits an unsigned
+local record. Metadata-only manifests are restricted to `eligible`. Missing
+advertised capability rows prevent record creation, and release claim checks
+must reject missing or expired exact tuple/capability rows. Review, signature,
+publication, and the initial physical hardware runs remain separate operations;
+the repository's synthetic harness fixtures are not physical qualification.
+
 This decision is implemented when:
 
 - a deterministic validation command writes the versioned record described above;
