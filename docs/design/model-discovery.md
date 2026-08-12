@@ -53,6 +53,27 @@ transactional: a failed download or validation leaves no model marked installed
 and preserves any previous usable revision. Gated models explain the required
 upstream action without accepting terms on the user's behalf.
 
+Before an installation is atomically finalized, Mun writes a versioned artifact
+manifest containing every downloaded file's normalized relative path, byte
+length, and SHA-256, plus the source repository, immutable revision,
+installation timestamp, `trust_remote_code` choice, and an aggregate manifest
+digest. The model metadata file and manifest file are the only allowed
+untracked files. Any other added file, including a later cache file, produces
+`unexpected_file`; cache data present during installation is recorded and
+verified like every other artifact.
+
+Mun verifies this manifest before the first Transformers load. Verification
+reports `verified`, `missing`, `modified`, `unexpected_file`, or
+`unsafe_remote_code`. An older installation without a manifest reports the
+typed `manifest_missing` result with reinstall guidance rather than crashing.
+Missing and changed required files fail closed. The aggregate digest is retained
+for later provenance records.
+
+Artifact hashes establish only that local bytes match the recorded installation.
+They cannot prove model safety, parser safety, absence of malicious behavior, or
+semantic quality. An installation with `trust_remote_code` is always described
+as unsafe, never tested or safe, even when all bytes verify.
+
 ## Prototype verdict
 
 The accepted concept was **C — Task-first setup** from

@@ -10,7 +10,7 @@ from typing import Any, Protocol
 
 from .core import Segment, Transcript, TranscriptionOptions, _audio_input_path, _cached_binary_path, _can_use_source_audio_directly
 from .errors import MunError
-from .models import InstalledModel
+from .models import InstalledModel, verify_installed_model
 from .transcript import ConverterIdentity, PreparedMediaRecord
 
 
@@ -32,6 +32,12 @@ class SpeechRuntime(Protocol):
 
 class TransformersRuntime:
     def __init__(self, model: InstalledModel, requested_device: str = "auto") -> None:
+        verification = verify_installed_model(model)
+        if verification.status not in {"verified", "unsafe_remote_code"}:
+            detail = f" ({', '.join(verification.paths)})" if verification.paths else ""
+            raise MunError(
+                f"Model integrity verification failed: {verification.status}{detail}. {verification.guidance}".strip()
+            )
         try:
             import torch
             from transformers import AutoConfig, pipeline
