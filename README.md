@@ -206,6 +206,29 @@ Replay checks the source digest and exact model/runtime tuple before inference,
 then reports a typed JSON outcome. Live-model tolerances are opt-in data files,
 not deterministic claims. See [bounded transcript replay](docs/design/reproducibility.md).
 
+### Run transcript quality qualification
+
+```sh
+mun qualify-run fixtures/quality/manifest.json -o qualification.json --deterministic-fake-runtime
+```
+
+The deterministic adapter validates the executable evidence workflow but cannot
+produce `tested` status. Physical/model-heavy runs must use a real public runtime
+adapter and are explicit opt-in. Records report WER/CER only where allowed,
+per fixture and mandatory language/domain stratum, against explicit thresholds.
+Missing fixtures or references, digest drift, expired evidence, tuple changes,
+and failed mandatory strata block release claims. Mun does not combine these
+measurements into a universal quality score.
+
+## Assurance classification
+
+- **Implemented:** canonical acceptance and receipts, producer-byte authentication,
+  operation journals, execution containment, and executable quality evidence.
+- **Requires physical qualification:** model/runtime/device performance, memory,
+  reproducibility, and quality for each exact tuple.
+- **Not enforceable by source code:** transcript truth, speaker consent, human
+  identity, universal erasure, model determinism, and physical hardware behavior.
+
 ## Outputs
 
 | Format | Purpose |

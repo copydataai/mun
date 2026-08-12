@@ -18,6 +18,7 @@ from .acceptance import create_acceptance
 from .artifacts import canonical_json_bytes
 from .authentication import sign_artifact, verify_artifact
 from .journal import resume_journal
+from .quality import DeterministicFixtureRuntime, run_quality_qualification
 from .config import config_path, load_config, reset_config, set_config
 from .core import (
     TranscriptionOptions,
@@ -155,6 +156,11 @@ def build_parser() -> argparse.ArgumentParser:
     resume = subcommands.add_parser("resume", help="classify and safely resume an interrupted batch journal")
     resume.add_argument("journal", type=Path)
 
+    quality = subcommands.add_parser("qualify-run", help="execute transcript quality fixtures with machine-readable evidence")
+    quality.add_argument("manifest", type=Path)
+    quality.add_argument("-o", "--output", type=Path, required=True)
+    quality.add_argument("--deterministic-fake-runtime", action="store_true", help="test the evidence workflow without claiming physical qualification")
+
     doctor = subcommands.add_parser("doctor", help="diagnose the local runtime")
     doctor.add_argument("--json", action="store_true")
     return parser
@@ -198,6 +204,16 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "resume":
             print(json.dumps(resume_journal(args.journal), sort_keys=True))
+            return 0
+        if args.command == "qualify-run":
+            if not args.deterministic_fake_runtime:
+                raise MunError("A real public runtime adapter is required; use --deterministic-fake-runtime only for workflow tests")
+            manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
+            record = run_quality_qualification(manifest, base_dir=args.manifest.parent, runtime=DeterministicFixtureRuntime())
+            if args.output.exists():
+                raise MunError("Refusing to overwrite a quality qualification record")
+            args.output.write_bytes(canonical_json_bytes(record) + b"\n")
+            print(json.dumps({"status": record["status"], "status_reason": record["status_reason"], "output": args.output.name}, sort_keys=True))
             return 0
         if args.command == "doctor":
             return command_doctor(args)
