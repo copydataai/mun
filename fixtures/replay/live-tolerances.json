@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "normalization": {
+    "casefold": true,
+    "collapse_whitespace": true,
+    "unicode_form": "NFKC"
+  },
+  "text": {
+    "max_word_error_rate": 0.0
+  },
+  "timestamp_ms": 50
+}

@@ -147,6 +147,16 @@ rewritten. Corrected TXT, SRT, and VTT retain the machine segment timings, while
 corrected JSON records `reviewed` or `unreviewed`, the parent and correction-set
 identities, and a distinct export digest.
 
+### Verify a transcript with bounded replay
+
+```sh
+mun replay transcripts/interview.json
+```
+
+Replay checks the source digest and exact model/runtime tuple before inference,
+then reports a typed JSON outcome. Live-model tolerances are opt-in data files,
+not deterministic claims. See [bounded transcript replay](docs/design/reproducibility.md).
+
 ## Outputs
 
 | Format | Purpose |

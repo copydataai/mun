@@ -25,6 +25,7 @@ from .core import (
 )
 from .errors import MunError
 from .review import CorrectionError, CorrectionSet, apply_corrections, render_reviewed
+from .replay import ReplayOutcome, replay_result
 from .transcript import TranscriptResult, make_batch_result
 from .models import (
     download_model,
@@ -113,6 +114,12 @@ def build_parser() -> argparse.ArgumentParser:
     review_render.add_argument("--view", choices=("machine", "corrected"), default="machine")
     review_render.add_argument("--format", choices=("txt", "json", "srt", "vtt"), default="txt")
 
+    replay = subcommands.add_parser("replay", help="verify a transcript result by bounded replay")
+    replay.add_argument("result", type=Path, help="canonical transcript result JSON")
+    replay.add_argument("--source", type=Path, help="source media; defaults to the recorded relative path")
+    replay.add_argument("--model-dir", help="managed model directory")
+    replay.add_argument("--tolerances", type=Path, help="explicit live-model tolerance JSON")
+
     doctor = subcommands.add_parser("doctor", help="diagnose the local runtime")
     doctor.add_argument("--json", action="store_true")
     return parser
@@ -136,6 +143,8 @@ def main(argv: list[str] | None = None) -> int:
             return command_config(args)
         if args.command == "review":
             return command_review(args)
+        if args.command == "replay":
+            return command_replay(args)
         if args.command == "doctor":
             return command_doctor(args)
         parser.print_help()
@@ -288,6 +297,36 @@ def command_review(args: argparse.Namespace) -> int:
         corrected = apply_corrections(machine, _read_correction_set(args.corrections))
     sys.stdout.write(render_reviewed(args.format, machine, corrected, args.view))
     return 0
+
+
+def command_replay(args: argparse.Namespace) -> int:
+    try:
+        expected = TranscriptResult.from_json(args.result.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        outcome = ReplayOutcome("unsupported_replay", reason=f"invalid_result:{type(exc).__name__}")
+    else:
+        source = args.source or args.result.parent / expected.source.relative_path
+        config = load_config()
+        root = models_root(config, args.model_dir)
+        try:
+            model = find_installed(root, expected.provenance.model.repository)
+            runtime = load_pipeline(model, expected.provenance.requested_device)[0]
+        except MunError as exc:
+            outcome = ReplayOutcome("artifact_unavailable", reason=str(exc))
+        else:
+            outcome = replay_result(
+                args.result,
+                source=source,
+                model=model,
+                runtime=runtime,
+                tolerance_file=args.tolerances,
+            )
+    print(json.dumps(outcome.to_dict(), ensure_ascii=False, indent=2))
+    if outcome.kind in {"exact_match", "projection_match", "within_tolerance"}:
+        return 0
+    if outcome.kind == "unsupported_replay":
+        return 2
+    return 1
 
 
 def _read_machine_result(path: Path) -> TranscriptResult:
