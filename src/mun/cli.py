@@ -232,10 +232,11 @@ def command_transcribe(args: argparse.Namespace) -> int:
         )
         if args.benchmark and started_at is not None:
             elapsed = time.perf_counter() - started_at
-            completed = sum(result.status == "completed" for result in summaries)
-            throughput = completed / elapsed if elapsed else 0.0
+            processed = sum(result.reuse_status in {"queued", "overwrite_required"} for result in summaries)
+            reused = sum(result.reuse_status == "reused_verified" for result in summaries)
+            throughput = processed / elapsed if elapsed else 0.0
             print(
-                f"Benchmark: files={len(media)} completed={completed} failed={len(failures)} "
+                f"Benchmark: files={len(media)} processed={processed} reused_verified={reused} failed={len(failures)} "
                 f"duration_s={elapsed:.2f} files_per_s={throughput:.2f} jobs={args.jobs}",
                 file=sys.stderr,
             )

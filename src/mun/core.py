@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 from types import SimpleNamespace
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -23,6 +23,7 @@ from .transcript import (
     OperationParameters,
     OperationRecord,
     PreparedMediaRecord,
+    ReuseStatus,
     SourceRecord,
     TranscriptResult,
     TranscriptSegment,
@@ -143,6 +144,94 @@ def _operation(runtime: Any, options: TranscriptionOptions, source_sha256: str |
         ),
         prepared_media=prepared,
         source_hash_policy=SOURCE_HASH_POLICY,
+    )
+
+
+def _matches_reuse_identity(
+    result: TranscriptResult,
+    media: SourceMedia,
+    model: InstalledModel,
+    options: TranscriptionOptions,
+    source_sha256: str | None,
+) -> bool:
+    operation = result.operation
+    if result.result_digest is None or operation is None:
+        return False
+    parameters = operation.parameters
+    return (
+        result.status == "completed"
+        and result.source.name == media.source.name
+        and result.source.relative_path == str(media.relative)
+        and result.source.sha256 == source_sha256
+        and result.provenance.model.repository == model.id
+        and result.provenance.model.revision == model.revision
+        and operation.source_hash_policy == SOURCE_HASH_POLICY
+        and parameters.language == options.language
+        and parameters.timestamps == options.timestamps
+        and parameters.translate == options.translate
+        and parameters.chunk_length == options.chunk_length
+        and parameters.stride_length == options.stride_length
+        and parameters.requested_device == options.device
+    )
+
+
+def _load_reusable_result(
+    json_path: Path,
+    expected_paths: list[Path],
+    media: SourceMedia,
+    model: InstalledModel,
+    options: TranscriptionOptions,
+) -> TranscriptResult | None:
+    try:
+        result = TranscriptResult.from_json(json_path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, KeyError):
+        return None
+    if not _matches_reuse_identity(result, media, model, options, _sha256_file(media.source)):
+        return None
+    for path in expected_paths:
+        if path == json_path:
+            continue
+        format_name = path.suffix.lstrip(".")
+        kind = "english_translation" if f".en.{format_name}" in path.name else (
+            "original" if f".original.{format_name}" in path.name else None
+        )
+        projection = result
+        if kind is not None:
+            from .transcript import select_variant
+
+            try:
+                projection = replace(result, transcripts=[select_variant(result, kind)])
+            except ValueError:
+                return None
+        try:
+            expected_content = render_output(format_name, projection, media, model, result.provenance.effective_device)
+            if path.read_text(encoding="utf-8") != expected_content:
+                return None
+        except (OSError, MunError):
+            return None
+    return replace(result, reuse_status="reused_verified")
+
+
+def _blocked_result(
+    media: SourceMedia,
+    model: InstalledModel,
+    options: TranscriptionOptions,
+    reuse_status: ReuseStatus,
+    code: str,
+    message: str,
+) -> TranscriptResult:
+    runtime = _batch_provenance_runtime(options.device, options.device)
+    source_sha256 = _sha256_file(media.source)
+    return TranscriptResult(
+        schema_version=SCHEMA_VERSION,
+        status="partial",
+        source=_source_record(media, source_sha256),
+        transcripts=[],
+        speakers=[],
+        diagnostics=[Diagnostic("warning", code, message, "output", True)],
+        provenance=_provenance(runtime, model, options),
+        operation=_operation(runtime, options, source_sha256),
+        reuse_status=reuse_status,
     )
 
 
@@ -333,32 +422,41 @@ def run_batch(
     jobs = min(jobs, os.cpu_count() or 1)
 
     queued: list[tuple[int, SourceMedia, Path]] = []
-    skipped: list[tuple[int, SourceMedia, Path]] = []
-
+    queued_status: dict[int, ReuseStatus] = {}
     queued_results: dict[int, TranscriptResult] = {}
 
     for index, item in enumerate(media, start=1):
         base = output_base(output_dir, item, used_bases)
         expected = output_paths(base, formats, options.translate)
-        if not overwrite and any(path.exists() for path in expected):
-            skipped.append((index, item, base))
+        existing = [path for path in expected if path.exists()]
+        if overwrite:
+            queued.append((index, item, base))
+            queued_status[index] = "overwrite_required" if existing else "queued"
             continue
-        queued.append((index, item, base))
+        if not existing:
+            queued.append((index, item, base))
+            queued_status[index] = "queued"
+            continue
+        if len(existing) != len(expected):
+            message = "Existing outputs form an incomplete projection set"
+            queued_results[index] = _blocked_result(
+                item, model, options, "incomplete_output_set", "incomplete_output_set", message
+            )
+            failures.append({"source": str(item.relative), "error": message})
+            progress(f"[{index}/{len(media)}] blocked {item.source} (incomplete output set)")
+            continue
+        json_path = next((path for path in expected if path.suffix == ".json"), None)
+        reused = _load_reusable_result(json_path, expected, item, model, options) if json_path is not None else None
+        if reused is not None:
+            queued_results[index] = reused
+            progress(f"[{index}/{len(media)}] reused {item.source} (verified canonical JSON)")
+            continue
+        message = "Existing outputs cannot be verified for reuse"
+        queued_results[index] = _blocked_result(item, model, options, "conflict", "output_conflict", message)
+        failures.append({"source": str(item.relative), "error": message})
+        progress(f"[{index}/{len(media)}] blocked {item.source} (output conflict)")
 
     if not queued:
-        fallback_runtime = runtime or _batch_provenance_runtime(options.device, options.device)
-        for index, item, _ in skipped:
-            progress(f"[{index}/{len(media)}] skipped {item.source} (output exists)")
-            queued_results[index] = TranscriptResult(
-                schema_version=SCHEMA_VERSION,
-                status="partial",
-                source=_source_record(item),
-                transcripts=[],
-                speakers=[],
-                diagnostics=[Diagnostic("warning", "output_exists", "Output already exists", "output", True)],
-                provenance=_provenance(fallback_runtime, model, options),
-                operation=_operation(fallback_runtime, options, _sha256_file(item.source)),
-            )
         for index in sorted(queued_results):
             summaries.append(queued_results[index])
         return summaries, failures
@@ -387,24 +485,12 @@ def run_batch(
     else:
         fallback_runtime = runtime
 
-    for index, item, _ in skipped:
-        progress(f"[{index}/{len(media)}] skipped {item.source} (output exists)")
-        queued_results[index] = TranscriptResult(
-            schema_version=SCHEMA_VERSION,
-            status="partial",
-            source=_source_record(item),
-            transcripts=[],
-            speakers=[],
-            diagnostics=[Diagnostic("warning", "output_exists", "Output already exists", "output", True)],
-            provenance=_provenance(fallback_runtime, model, options),
-            operation=_operation(fallback_runtime, options, _sha256_file(item.source)),
-        )
-
     if jobs == 1:
         for index, item, base in queued:
             progress(f"[{index}/{len(media)}] transcribing {item.source} ({effective_device}, {model.id})")
             try:
                 result = transcribe_source(runtime, item, model, options)
+                result = replace(result, reuse_status=queued_status[index])
                 if result.status == "completed":
                     write_result_outputs(base, formats, result, options.translate, overwrite=overwrite)
                 queued_results[index] = result
@@ -421,6 +507,7 @@ def run_batch(
                     diagnostics=[Diagnostic("error", "transcription_failed", "Transcription failed", "transcription", False)],
                     provenance=_provenance(runtime, model, options),
                     operation=_operation(runtime, options, _sha256_file(item.source)),
+                    reuse_status=queued_status[index],
                 )
                 progress(f"[{index}/{len(media)}] failed {item.source}: {exc}")
 
@@ -447,6 +534,7 @@ def run_batch(
             progress(f"[{index}/{len(media)}] transcribing {item.source} ({effective_device}, {model.id})")
             try:
                 _, result = future.result()
+                result = replace(result, reuse_status=queued_status[index])
             except Exception:
                 result = TranscriptResult(
                     schema_version=SCHEMA_VERSION,
@@ -457,6 +545,7 @@ def run_batch(
                     diagnostics=[Diagnostic("error", "transcription_failed", "Transcription failed", "transcription", False)],
                     provenance=_provenance(fallback_runtime, model, options),
                     operation=_operation(fallback_runtime, options, _sha256_file(item.source)),
+                    reuse_status=queued_status[index],
                 )
 
             completed[index] = result

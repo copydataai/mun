@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -179,6 +180,46 @@ class CliTests(unittest.TestCase):
             self.assertEqual(batch_requests[0]["media_count"], 2)
             self.assertEqual(batch_requests[0]["jobs"], 1)
             self.assertEqual(batch_requests[0]["formats"], ["txt"])
+
+    def test_verified_reuse_succeeds_and_is_counted_separately(self) -> None:
+        result = TranscriptResult(
+            schema_version=1,
+            status="completed",
+            source=SourceRecord("one.wav", "one.wav"),
+            transcripts=[],
+            speakers=[],
+            diagnostics=[],
+            provenance=make_provenance(
+                mun_version="0.1.0",
+                model_id="owner/model",
+                revision="abc123",
+                runtime_name="transformers",
+                runtime_version="0",
+                requested_device="cpu",
+                effective_device="cpu",
+                precision="float32",
+            ),
+            reuse_status="reused_verified",
+        )
+        model = InstalledModel("owner/model", "abc123", "/models/model", "2026-08-11T00:00:00+00:00")
+        args = build_parser().parse_args(["transcribe", "one.wav", "--summary-json", "--benchmark"])
+        output = io.StringIO()
+        error = io.StringIO()
+
+        with patch("mun.cli.load_config", return_value={}), \
+            patch("mun.cli.discover_media", return_value=[SourceMedia(Path("one.wav"), Path("one.wav"))]), \
+            patch("mun.cli.models_root", return_value=Path("/models")), \
+            patch("mun.cli.find_installed", return_value=model), \
+            patch("mun.cli.load_pipeline", return_value=(SimpleNamespace(info=SimpleNamespace(effective_device="cpu")), "cpu", "transformers")), \
+            patch("mun.cli.run_batch", return_value=([result], [])), \
+            contextlib.redirect_stdout(output), contextlib.redirect_stderr(error):
+            status = command_transcribe(args)
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(status, 0)
+        self.assertEqual(payload["counts"]["processed"], 0)
+        self.assertEqual(payload["counts"]["reused_verified"], 1)
+        self.assertIn("processed=0 reused_verified=1", error.getvalue())
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ from .artifacts import machine_result_digest, validate_machine_result
 
 SCHEMA_VERSION = 1
 Status = Literal["completed", "partial", "failed", "cancelled"]
+ReuseStatus = Literal["reused_verified", "conflict", "incomplete_output_set", "overwrite_required", "queued"]
 TranscriptKind = Literal["original", "english_translation"]
 LanguageSource = Literal["detected", "forced", "model", "unknown"]
 
@@ -151,13 +152,16 @@ class TranscriptResult:
     operation: OperationRecord | None = None
     overlap_ms: int = 0
     result_digest: str | None = None
+    reuse_status: ReuseStatus = "queued"
 
     def __post_init__(self) -> None:
         if self.result_digest is None:
-            object.__setattr__(self, "result_digest", machine_result_digest(self))
+            object.__setattr__(self, "result_digest", machine_result_digest(self.to_dict()))
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        payload = asdict(self)
+        payload.pop("reuse_status")
+        return payload
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), ensure_ascii=False, indent=2) + "\n"
@@ -186,8 +190,17 @@ class BatchResult:
 
 def make_batch_result(files: list[TranscriptResult]) -> BatchResult:
     counts = {status: 0 for status in ("completed", "partial", "failed", "cancelled")}
+    counts.update({status: 0 for status in ("processed", "reused_verified", "conflict", "incomplete_output_set", "overwrite_required")})
     for result in files:
         counts[result.status] = counts.get(result.status, 0) + 1
+        if result.reuse_status == "reused_verified":
+            counts["reused_verified"] += 1
+        elif result.reuse_status in {"conflict", "incomplete_output_set"}:
+            counts[result.reuse_status] += 1
+        else:
+            counts["processed"] += 1
+            if result.reuse_status == "overwrite_required":
+                counts["overwrite_required"] += 1
     return BatchResult(SCHEMA_VERSION, files, counts)
 
 

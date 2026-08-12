@@ -62,7 +62,7 @@ mun models download openai/whisper-small
 mun transcribe interview.m4a
 ```
 
-Transcripts are written to `./transcripts/`. Existing files are skipped unless you pass `--overwrite`.
+Transcripts are written to `./transcripts/`. Existing outputs are reused only when the complete requested projection set includes canonical JSON whose digest, source identity, operation parameters, model identity, and derived projections all validate. Unrelated files, invalid artifacts, and incomplete output sets block that source with a recoverable nonzero result. Pass `--overwrite` to replace only the output paths explicitly requested by the current command.
 
 ## Common workflows
 
@@ -139,6 +139,10 @@ Progress and warnings go to stderr, so redirected stdout remains valid.
 | `vtt` | WebVTT subtitles with timestamps |
 
 Mun writes each file atomically: an incomplete transcript is never moved into its final path. Files rejected during media discovery are skipped; if transcription fails after processing begins, completed transcripts are preserved, the remaining files continue, and Mun exits nonzero.
+
+Batch summary counts distinguish newly processed files from `reused_verified`, `conflict`, `incomplete_output_set`, and `overwrite_required` plans. A verified reuse can succeed without loading the speech model. Conflicts and incomplete sets are recoverable by moving the existing files or rerunning with `--overwrite`.
+
+Artifact validation establishes internal consistency only. A matching digest proves that the JSON has not changed relative to its own recorded digest, not that the transcript was honestly produced, that the recorded provenance is true, or that a trusted producer signed it. Mun does not currently provide producer signatures.
 
 FFmpeg converts source media into temporary mono audio when needed. Temporary audio is removed after success, failure, or cancellation. Media already suitable for inference can bypass conversion.
 
