@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from mun.cli import _existing_ancestor, build_parser, command_transcribe, interactive_wizard, main
 from mun.core import SourceMedia
+from mun.journal import JournalError
 from mun.models import InstalledModel, _write_metadata
 from mun.transcript import SourceRecord, TranscriptResult, make_provenance
 
@@ -21,6 +22,16 @@ class CliTests(unittest.TestCase):
     def assert_private_home_absent(self, value: str) -> None:
         self.assertNotIn(str(Path.home()), value)
         self.assertNotIn(Path.home().name, value)
+
+    def test_batch_journal_binding_error_is_not_reported_as_transcription_failure(self) -> None:
+        errors = io.StringIO()
+        with patch("mun.cli.command_transcribe", side_effect=JournalError("Existing incomplete journal has a distinct operation binding")), \
+                contextlib.redirect_stderr(errors):
+            status = main(["transcribe", "source.wav"])
+
+        self.assertEqual(status, 1)
+        self.assertEqual(errors.getvalue(), "error: Existing incomplete journal has a distinct operation binding\n")
+        self.assertNotIn("Transcription failed", errors.getvalue())
 
     def test_model_removal_cli_redacts_home_paths_in_receipt(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:

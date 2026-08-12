@@ -16,6 +16,85 @@ from mun.runtime import FakeSpeechRuntime
 
 
 class JournalTests(unittest.TestCase):
+    def _runtime_and_model(self, text: str = "Recovered"):
+        model = InstalledModel("example/model", "abc123", "/models/example", "2026-08-09T00:00:00Z")
+        runtime = FakeSpeechRuntime(Transcript(text, [Segment(text, 0.0, 1.0)], "en"))
+        runtime.model_artifact_sha256 = "a" * 64
+        runtime.test_installed_model = model
+        return runtime, model
+
+    def test_sequential_distinct_batches_rotate_completed_journal_and_retain_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "out"
+            first = root / "first.wav"
+            second = root / "second.wav"
+            first.write_bytes(b"first source")
+            second.write_bytes(b"second source")
+            runtime, model = self._runtime_and_model()
+
+            run_batch([SourceMedia(first, Path("first.wav"))], model, output, ["txt"],
+                      TranscriptionOptions(), False, lambda _: None, runtime=runtime)
+            first_payload = json.loads((output / "mun-batch.journal.json").read_text(encoding="utf-8"))
+            run_batch([SourceMedia(second, Path("second.wav"))], model, output, ["txt"],
+                      TranscriptionOptions(), False, lambda _: None, runtime=runtime)
+
+            current = json.loads((output / "mun-batch.journal.json").read_text(encoding="utf-8"))
+            retained = list(output.glob("mun-batch.journal.completed-*.json"))
+            self.assertEqual(current["sources"][0]["binding"]["relative_path"], "second.wav")
+            self.assertEqual(len(retained), 1)
+            self.assertEqual(json.loads(retained[0].read_text(encoding="utf-8")), first_payload)
+
+    def test_exact_incomplete_binding_is_reused_without_replacing_journal_identity(self) -> None:
+        class ProcessDeath(BaseException):
+            pass
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.wav"
+            source.write_bytes(b"source")
+            runtime, model = self._runtime_and_model()
+            media = SourceMedia(source, Path("source.wav"))
+
+            with self.assertRaises(ProcessDeath):
+                run_batch([media], model, root / "out", ["txt"], TranscriptionOptions(), False,
+                          lambda _: None, runtime=runtime,
+                          fault_injector=lambda boundary: (_ for _ in ()).throw(ProcessDeath())
+                          if boundary == "pre_inference" else None)
+            journal = root / "out" / "mun-batch.journal.json"
+            binding_digest = OperationJournal.load(journal).payload["sources"][0]["binding_digest"]
+
+            results, failures = run_batch([media], model, root / "out", ["txt"],
+                                          TranscriptionOptions(), False, lambda _: None, runtime=runtime)
+
+            self.assertEqual(failures, [])
+            self.assertEqual(results[0].status, "completed")
+            self.assertEqual(OperationJournal.load(journal).payload["sources"][0]["binding_digest"], binding_digest)
+            self.assertEqual(list((root / "out").glob("mun-batch.journal.completed-*.json")), [])
+
+    def test_stale_incomplete_journal_rejects_distinct_binding_before_inference(self) -> None:
+        class ProcessDeath(BaseException):
+            pass
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = root / "first.wav"
+            second = root / "second.wav"
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            runtime, model = self._runtime_and_model()
+
+            with self.assertRaises(ProcessDeath):
+                run_batch([SourceMedia(first, Path("first.wav"))], model, root / "out", ["txt"],
+                          TranscriptionOptions(), False, lambda _: None, runtime=runtime,
+                          fault_injector=lambda boundary: (_ for _ in ()).throw(ProcessDeath())
+                          if boundary == "pre_inference" else None)
+            with patch.object(runtime, "transcribe") as transcribe:
+                with self.assertRaisesRegex(JournalError, "binding"):
+                    run_batch([SourceMedia(second, Path("second.wav"))], model, root / "out", ["txt"],
+                              TranscriptionOptions(), False, lambda _: None, runtime=runtime)
+                transcribe.assert_not_called()
+
     def _partial_commit(self, root: Path):
         class ProcessDeath(BaseException):
             pass

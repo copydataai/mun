@@ -17,7 +17,7 @@ from typing import Any, Callable, Iterable, Mapping
 from .errors import MunError
 from .containment import ContainmentError, run_contained
 from .models import InstalledModel, VerificationResult, verify_installed_model
-from .journal import OperationJournal
+from .journal import JournalError, OperationJournal
 from . import __version__
 from .transcript import (
     SCHEMA_VERSION,
@@ -723,7 +723,16 @@ def run_batch(
         _journal_binding(item, model, options, formats, base, overwrite, fallback_runtime)
         for _, item, base in queued
     ]
-    journal = OperationJournal.load(journal_path) if journal_path.exists() else OperationJournal.create(journal_path, bindings)
+    if journal_path.exists():
+        journal = OperationJournal.load(journal_path)
+        matches = journal.matches_bindings(bindings)
+        if journal.is_verified_complete():
+            journal.archive_completed()
+            journal = OperationJournal.create(journal_path, bindings)
+        elif not matches:
+            raise JournalError("Existing incomplete journal has a distinct operation binding")
+    else:
+        journal = OperationJournal.create(journal_path, bindings)
 
     if jobs == 1:
         for queued_position, (index, item, base) in enumerate(queued):

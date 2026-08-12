@@ -94,6 +94,34 @@ class OperationJournal:
             })
         return outcomes
 
+    def matches_bindings(self, bindings: list[Mapping[str, Any]]) -> bool:
+        expected = [deepcopy(dict(binding)) for binding in bindings]
+        observed = [row.get("binding") for row in self.payload["sources"]]
+        return canonical_json_bytes(observed) == canonical_json_bytes(expected)
+
+    def is_verified_complete(self) -> bool:
+        outcomes = self.classify()
+        return bool(outcomes) and all(item["classification"] == "verified-complete" for item in outcomes)
+
+    def archive_completed(self) -> Path:
+        if not self.is_verified_complete():
+            raise JournalError("Only verified-complete journals may be archived")
+        identity = sha256(canonical_json_bytes(self.payload)).hexdigest()[:16]
+        archive = self.path.with_name(f"{self.path.stem}.completed-{identity}{self.path.suffix}")
+        if archive.exists():
+            try:
+                if archive.read_bytes() != self.path.read_bytes():
+                    raise JournalError("Completed journal evidence identity conflicts")
+                self.path.unlink()
+            except OSError as exc:
+                raise JournalError("Cannot retain completed journal evidence") from exc
+        else:
+            try:
+                os.replace(self.path, archive)
+            except OSError as exc:
+                raise JournalError("Cannot retain completed journal evidence") from exc
+        return archive
+
     def _persist(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
