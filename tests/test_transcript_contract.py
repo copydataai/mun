@@ -10,6 +10,7 @@ from unittest.mock import patch
 from mun.errors import MunError
 
 from mun.core import (
+    ExportCommitError,
     Segment,
     SourceMedia,
     Transcript,
@@ -155,6 +156,68 @@ class TranscriptContractTests(unittest.TestCase):
                     written,
                     [Path(f"{base}.json"), Path(f"{base}.original.txt"), Path(f"{base}.en.txt")],
                 )
+
+    def test_render_failure_leaves_no_final_projection_and_records_failed_before_commit(self) -> None:
+        result = run_transcription_workflow([self.media], self.model, TranscriptionOptions(), runtime=self.runtime)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary) / "source"
+
+            def fail_txt_render(format_name, *args):
+                if format_name == "txt":
+                    raise MunError("cannot render")
+                return render_output(format_name, *args)
+
+            with patch("mun.core.render_output", side_effect=fail_txt_render):
+                with self.assertRaises(MunError):
+                    write_result_outputs(base, ["txt", "json"], result, translated=False, overwrite=False)
+
+            receipt = json.loads(Path(f"{base}.receipt.json").read_text(encoding="utf-8"))
+            self.assertEqual(receipt["state"], "failed_before_commit")
+            self.assertEqual(receipt["committed_paths"], [])
+            self.assertEqual(receipt["uncommitted_paths"], [str(Path(f"{base}.json")), str(Path(f"{base}.txt"))])
+            self.assertFalse(Path(f"{base}.txt").exists())
+            self.assertFalse(Path(f"{base}.json").exists())
+            self.assertEqual(list(Path(temporary).glob(".mun-stage-*")), [])
+
+    def test_commit_failure_reports_exact_partial_commit_paths(self) -> None:
+        result = run_transcription_workflow([self.media], self.model, TranscriptionOptions(), runtime=self.runtime)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary) / "source"
+            real_replace = Path.replace
+            destinations = [Path(f"{base}.json"), Path(f"{base}.txt")]
+
+            def fail_second_commit(path: Path, target: Path):
+                if target == destinations[1]:
+                    raise OSError("disk failure")
+                return real_replace(path, target)
+
+            with patch.object(Path, "replace", autospec=True, side_effect=fail_second_commit):
+                with self.assertRaises(ExportCommitError) as caught:
+                    write_result_outputs(base, ["txt", "json"], result, translated=False, overwrite=False)
+
+            self.assertEqual(caught.exception.committed_paths, [destinations[0]])
+            self.assertEqual(caught.exception.uncommitted_paths, [destinations[1]])
+            receipt = json.loads(Path(f"{base}.receipt.json").read_text(encoding="utf-8"))
+            self.assertEqual(receipt["state"], "partial_commit")
+            self.assertEqual(receipt["committed_paths"], [str(destinations[0])])
+            self.assertEqual(receipt["uncommitted_paths"], [str(destinations[1])])
+            self.assertTrue(destinations[0].exists())
+            self.assertFalse(destinations[1].exists())
+            self.assertEqual(list(Path(temporary).glob(".mun-stage-*")), [])
+
+    def test_precommit_cancellation_writes_cancelled_receipt_without_final_paths(self) -> None:
+        result = run_transcription_workflow([self.media], self.model, TranscriptionOptions(), runtime=self.runtime)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary) / "source"
+            with patch("mun.core.render_output", side_effect=KeyboardInterrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    write_result_outputs(base, ["txt"], result, translated=False, overwrite=False)
+
+            receipt = json.loads(Path(f"{base}.receipt.json").read_text(encoding="utf-8"))
+            self.assertEqual(receipt["state"], "cancelled")
+            self.assertEqual(receipt["committed_paths"], [])
+            self.assertFalse(Path(f"{base}.txt").exists())
+            self.assertEqual(list(Path(temporary).glob(".mun-stage-*")), [])
 
     def test_failed_result_does_not_expose_exception_details(self) -> None:
         class FailingRuntime:

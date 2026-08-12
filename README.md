@@ -138,7 +138,9 @@ Progress and warnings go to stderr, so redirected stdout remains valid.
 | `srt` | SubRip subtitles with timestamps |
 | `vtt` | WebVTT subtitles with timestamps |
 
-Mun writes each file atomically: an incomplete transcript is never moved into its final path. Files rejected during media discovery are skipped; if transcription fails after processing begins, completed transcripts are preserved, the remaining files continue, and Mun exits nonzero.
+For each source, Mun renders every requested projection into a private staging directory on the destination filesystem, hashes and validates the staged files, checks the complete destination set, and then commits files in deterministic path order. Existing destinations are refused unless `--overwrite` is explicit. Staging is removed after normal failure or cancellation.
+
+Each attempt persists `<name>.receipt.json` with one of `completed`, `cancelled`, `failed_before_commit`, or `partial_commit`. A partial commit records the exact committed and uncommitted paths. Earlier completed sources remain in place if a later source fails or is cancelled. This is not multi-file filesystem atomicity: a failure during the ordered commit can leave the exact partial set described by the receipt. Success exits 0; failed, partial, and cancelled workflows exit 1; command-line usage errors exit 2.
 
 Batch summary counts distinguish newly processed files from `reused_verified`, `conflict`, `incomplete_output_set`, and `overwrite_required` plans. A verified reuse can succeed without loading the speech model. Conflicts and incomplete sets are recoverable by moving the existing files or rerunning with `--overwrite`.
 

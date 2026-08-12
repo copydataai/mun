@@ -11,6 +11,7 @@ from .artifacts import machine_result_digest, validate_machine_result
 
 SCHEMA_VERSION = 1
 Status = Literal["completed", "partial", "failed", "cancelled"]
+ExportReceiptState = Literal["completed", "cancelled", "failed_before_commit", "partial_commit"]
 ReuseStatus = Literal["reused_verified", "conflict", "incomplete_output_set", "overwrite_required", "queued"]
 TranscriptKind = Literal["original", "english_translation"]
 LanguageSource = Literal["detected", "forced", "model", "unknown"]
@@ -70,6 +71,27 @@ class SourceRecord:
     relative_path: str
     duration_ms: int | None = None
     sha256: str | None = None
+
+
+@dataclass(frozen=True)
+class ExportArtifact:
+    path: str
+    sha256: str
+    size_bytes: int
+
+
+@dataclass(frozen=True)
+class ExportReceipt:
+    schema_version: int
+    state: ExportReceiptState
+    source: str
+    result_digest: str | None
+    artifacts: list[ExportArtifact]
+    committed_paths: list[str]
+    uncommitted_paths: list[str]
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self), ensure_ascii=False, indent=2) + "\n"
 
 
 @dataclass(frozen=True)

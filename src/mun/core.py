@@ -19,6 +19,9 @@ from . import __version__
 from .transcript import (
     SCHEMA_VERSION,
     Diagnostic,
+    ExportArtifact,
+    ExportReceipt,
+    ExportReceiptState,
     Language,
     OperationParameters,
     OperationRecord,
@@ -42,6 +45,13 @@ MEDIA_EXTENSIONS = {
 _FFPROBE_CACHE: dict[Path, tuple[bool, bool]] = {}
 _BINARY_PATH_CACHE: dict[str, str | None] = {}
 SOURCE_HASH_POLICY = "sha256_source_bytes"
+
+
+class ExportCommitError(MunError):
+    def __init__(self, committed_paths: list[Path], uncommitted_paths: list[Path]) -> None:
+        super().__init__("Export commit failed after some projections were committed")
+        self.committed_paths = committed_paths
+        self.uncommitted_paths = uncommitted_paths
 
 
 def _cached_binary_path(name: str, missing_error: str) -> str:
@@ -497,6 +507,19 @@ def run_batch(
                 progress(f"[{index}/{len(media)}] {result.status} {item.source}")
             except KeyboardInterrupt:
                 raise
+            except ExportCommitError:
+                queued_results[index] = TranscriptResult(
+                    schema_version=SCHEMA_VERSION,
+                    status="partial",
+                    source=_source_record(item),
+                    transcripts=[],
+                    speakers=[],
+                    diagnostics=[Diagnostic("error", "partial_commit", "Export commit was only partially completed", "export", False)],
+                    provenance=_provenance(runtime, model, options),
+                    operation=_operation(runtime, options, _sha256_file(item.source)),
+                    reuse_status=queued_status[index],
+                )
+                progress(f"[{index}/{len(media)}] partial {item.source} (export commit incomplete)")
             except Exception as exc:
                 queued_results[index] = TranscriptResult(
                     schema_version=SCHEMA_VERSION,
@@ -559,9 +582,17 @@ def run_batch(
         result = queued_results[index]
         base = base_by_index.get(index)
         if result.status == "completed" and base is not None:
-            write_result_outputs(base, formats, result, options.translate, overwrite=overwrite)
+            try:
+                write_result_outputs(base, formats, result, options.translate, overwrite=overwrite)
+            except ExportCommitError:
+                result = replace(
+                    result,
+                    status="partial",
+                    transcripts=[],
+                    diagnostics=[Diagnostic("error", "partial_commit", "Export commit was only partially completed", "export", False)],
+                )
         summaries.append(result)
-        if result.status == "failed":
+        if result.status in {"failed", "partial"}:
             failures.append({"source": str(result.source.relative_path), "error": result.diagnostics[0].message if result.diagnostics else "failed"})
         progress(f"[{index}/{len(media)}] {result.status} {result.source.name}")
 
@@ -670,35 +701,93 @@ def write_result_outputs(
     translated: bool,
     overwrite: bool,
 ) -> list[Path]:
-    written: list[Path] = []
+    projections: list[tuple[Path, str, TranscriptResult]] = []
     for format_name in formats:
-        projections = [("", None)]
+        variants = [("", None)]
         if translated and format_name != "json":
-            projections = [("original", "original"), ("en", "english_translation")]
-        for label, kind in projections:
+            variants = [("original", "original"), ("en", "english_translation")]
+        for label, kind in variants:
             if kind and not any(variant.kind == kind for variant in result.transcripts):
                 continue
             labelled_base = Path(f"{base}.{label}") if label else base
             path = Path(f"{labelled_base}.{format_name}")
-            if path.exists() and not overwrite:
-                raise MunError(f"Output already exists: {path}")
             if kind:
                 from .transcript import select_variant
                 single = TranscriptResult(**{**result.__dict__, "transcripts": [select_variant(result, kind)]})
             else:
                 single = result
-            _atomic_write(
-                path,
-                render_output(
-                    format_name,
-                    single,
-                    SourceMedia(Path(result.source.name), Path(result.source.relative_path)),
-                    InstalledModel(result.provenance.model.repository, result.provenance.model.revision or "", "", ""),
-                    result.provenance.effective_device,
-                ),
+            projections.append((path, format_name, single))
+
+    requested_destinations = [path for path, _, _ in projections]
+    projections.sort(key=lambda projection: str(projection[0]))
+    destinations = [path for path, _, _ in projections]
+    receipt_path = Path(f"{base}.receipt.json")
+    artifacts: list[ExportArtifact] = []
+    committed: list[Path] = []
+
+    def persist_receipt(state: ExportReceiptState) -> None:
+        receipt = ExportReceipt(
+            schema_version=1,
+            state=state,  # type: ignore[arg-type]
+            source=result.source.relative_path,
+            result_digest=result.result_digest,
+            artifacts=artifacts,
+            committed_paths=[str(path) for path in committed],
+            uncommitted_paths=[str(path) for path in destinations if path not in committed],
+        )
+        _atomic_write(receipt_path, receipt.to_json())
+
+    existing = [path for path in destinations if path.exists()]
+    if existing and not overwrite:
+        persist_receipt("failed_before_commit")
+        raise MunError(f"Output already exists: {existing[0]}")
+
+    base.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=".mun-stage-", dir=base.parent))
+    os.chmod(staging, 0o700)
+    staged: list[tuple[Path, Path]] = []
+    try:
+        for index, (destination, format_name, single) in enumerate(projections):
+            content = render_output(
+                format_name,
+                single,
+                SourceMedia(Path(result.source.name), Path(result.source.relative_path)),
+                InstalledModel(result.provenance.model.repository, result.provenance.model.revision or "", "", ""),
+                result.provenance.effective_device,
             )
-            written.append(path)
-    return written
+            staged_path = staging / f"{index:04d}-{destination.name}"
+            staged_path.write_text(content, encoding="utf-8")
+            digest = _sha256_file(staged_path)
+            if digest is None:
+                raise MunError(f"Cannot validate staged export: {destination}")
+            if format_name == "json":
+                TranscriptResult.from_json(staged_path.read_text(encoding="utf-8"))
+            artifacts.append(ExportArtifact(str(destination), digest, staged_path.stat().st_size))
+            staged.append((staged_path, destination))
+
+        for staged_path, destination in staged:
+            try:
+                staged_path.replace(destination)
+            except BaseException as exc:
+                persist_receipt("partial_commit" if committed else ("cancelled" if isinstance(exc, KeyboardInterrupt) else "failed_before_commit"))
+                if committed:
+                    raise ExportCommitError(committed.copy(), [path for path in destinations if path not in committed]) from exc
+                raise
+            committed.append(destination)
+        persist_receipt("completed")
+        return requested_destinations
+    except KeyboardInterrupt:
+        if not committed:
+            persist_receipt("cancelled")
+        raise
+    except ExportCommitError:
+        raise
+    except BaseException:
+        if not committed:
+            persist_receipt("failed_before_commit")
+        raise
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 def render_output(

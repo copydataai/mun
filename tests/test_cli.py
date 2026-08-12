@@ -221,6 +221,21 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["counts"]["reused_verified"], 1)
         self.assertIn("processed=0 reused_verified=1", error.getvalue())
 
+    def test_keyboard_interrupt_at_transcription_workflow_boundary_is_cancelled_and_nonzero(self) -> None:
+        model = InstalledModel("owner/model", "abc123", "/models/model", "2026-08-11T00:00:00+00:00")
+        args = build_parser().parse_args(["transcribe", "one.wav"])
+
+        with patch("mun.cli.load_config", return_value={}), \
+            patch("mun.cli.discover_media", return_value=[SourceMedia(Path("one.wav"), Path("one.wav"))]), \
+            patch("mun.cli.models_root", return_value=Path("/models")), \
+            patch("mun.cli.find_installed", return_value=model), \
+            patch("mun.cli.load_pipeline", return_value=(SimpleNamespace(info=SimpleNamespace(effective_device="cpu")), "cpu", "transformers")), \
+            patch("mun.cli.run_batch", side_effect=KeyboardInterrupt), \
+            contextlib.redirect_stderr(io.StringIO()):
+            status = command_transcribe(args)
+
+        self.assertEqual(status, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -189,9 +189,27 @@ A batch machine result contains `schema_version`, an ordered `files` array of
 continues after a file failure. Completed outputs remain preserved on failure
 or cancellation.
 
-The CLI exits 0 when every requested file completes, 1 when any file is partial
-or failed, and 130 when cancelled. It writes diagnostics to stderr and reserves
-stdout for the requested machine result.
+The CLI exits 0 when every requested file completes, 1 when any file is partial,
+failed, or cancelled, and 2 for command-line usage errors. It writes diagnostics
+to stderr and reserves stdout for the requested machine result.
+
+## Export transaction receipts
+
+Each completed transcript result is exported as a per-source transaction. Mun
+renders every requested projection into a mode-0700 staging directory beside
+the destinations, hashes and validates staged content, refuses any existing
+destination unless overwrite was explicitly requested, and commits in sorted
+destination-path order. The staging directory is removed after success,
+pre-commit failure, or cancellation.
+
+Mun atomically replaces each individual file, but does not claim multi-file
+filesystem atomicity. A receipt named `<output-base>.receipt.json` records
+`completed`, `cancelled`, `failed_before_commit`, or `partial_commit`, the staged
+artifact hashes and sizes, and exact committed and uncommitted destination
+paths. `partial_commit` means at least one destination was committed before a
+later commit failed. A workflow-boundary interruption is reported as cancelled
+with exit status 1 after its receipt has been flushed; previously completed
+sources remain committed.
 
 ## Deterministic renderers
 
@@ -215,7 +233,6 @@ All text files use UTF-8 and LF endings.
   and `.en` files only for variants that contain timed segments.
 
 JSON, JSONC, and Markdown each contain all transcript variants in one file.
-Requesting a renderer that cannot represent available data records a diagnostic
-and makes that file result `partial`; other requested renderings are still
-written atomically. Existing files are never overwritten without explicit
-permission.
+Requesting a renderer that cannot represent available data fails before commit,
+so no projection from that source reaches a final path. Existing files are never
+overwritten without explicit permission.

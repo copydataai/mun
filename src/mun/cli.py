@@ -126,8 +126,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 2
     except KeyboardInterrupt:
-        print("\nCancelled; completed outputs were preserved.", file=sys.stderr)
-        return 130
+        print("\nCancelled; export receipts were flushed and completed outputs were preserved.", file=sys.stderr)
+        return 1
     except MunError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -219,17 +219,21 @@ def command_transcribe(args: argparse.Namespace) -> int:
             print(message, file=sys.stderr)
 
         started_at = time.perf_counter() if args.benchmark else None
-        summaries, failures = run_batch(
-            media,
-            model,
-            output_dir,
-            formats,
-            options,
-            args.overwrite,
-            progress,
-            runtime=runtime,
-            jobs=args.jobs,
-        )
+        try:
+            summaries, failures = run_batch(
+                media,
+                model,
+                output_dir,
+                formats,
+                options,
+                args.overwrite,
+                progress,
+                runtime=runtime,
+                jobs=args.jobs,
+            )
+        except KeyboardInterrupt:
+            print("Cancelled; export receipts were flushed and completed sources were preserved.", file=sys.stderr)
+            return 1
         if args.benchmark and started_at is not None:
             elapsed = time.perf_counter() - started_at
             processed = sum(result.reuse_status in {"queued", "overwrite_required"} for result in summaries)
