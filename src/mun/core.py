@@ -43,7 +43,17 @@ MEDIA_EXTENSIONS = {
     ".aac", ".aiff", ".alac", ".avi", ".flac", ".m4a", ".mkv", ".mov", ".mp3",
     ".mp4", ".mpeg", ".mpg", ".oga", ".ogg", ".opus", ".wav", ".webm", ".wma",
 }
-_FFPROBE_CACHE: dict[Path, tuple[bool, bool]] = {}
+@dataclass(frozen=True)
+class MediaProbe:
+    is_audio: bool
+    is_whisper_ready: bool
+    media_format: str | None
+    codec: str | None
+    sample_rate_hz: int | None
+    channels: int | None
+
+
+_FFPROBE_CACHE: dict[Path, MediaProbe] = {}
 _BINARY_PATH_CACHE: dict[str, str | None] = {}
 SOURCE_HASH_POLICY = "sha256_source_bytes"
 
@@ -141,7 +151,15 @@ def _source_record(media: SourceMedia, sha256: str | None = None) -> SourceRecor
 def _operation(runtime: Any, options: TranscriptionOptions, source_sha256: str | None) -> OperationRecord:
     prepared = getattr(runtime, "prepared_media", None)
     if prepared is None:
-        prepared = PreparedMediaRecord(False, source_sha256, None, None, None, None)
+        prepared = PreparedMediaRecord(
+            used=False,
+            sha256=source_sha256,
+            media_format=None,
+            codec=None,
+            sample_rate_hz=None,
+            channels=None,
+            converter=None,
+        )
     return OperationRecord(
         parameters=OperationParameters(
             language=options.language,
@@ -253,6 +271,11 @@ def _probe_media(path: Path) -> tuple[bool, bool]:
     The second result is true when the input can be passed directly to the speech
     pipeline without a temporary conversion to 16 kHz mono PCM.
     """
+    probe = _probe_media_details(path)
+    return probe.is_audio, probe.is_whisper_ready
+
+
+def _probe_media_details(path: Path) -> MediaProbe:
     key = path.resolve()
     cached = _FFPROBE_CACHE.get(key)
     if cached is not None:
@@ -262,7 +285,7 @@ def _probe_media(path: Path) -> tuple[bool, bool]:
     result = subprocess.run(
         [
             ffprobe, "-v", "error", "-select_streams", "a:0",
-            "-show_entries", "stream=codec_name,channels,sample_rate",
+            "-show_entries", "stream=codec_name,channels,sample_rate:format=format_name",
             "-of", "json",
             str(path),
         ],
@@ -271,11 +294,16 @@ def _probe_media(path: Path) -> tuple[bool, bool]:
         check=False,
     )
     if result.returncode != 0:
-        _FFPROBE_CACHE[key] = (False, False)
-        return False, False
+        probe = MediaProbe(False, False, None, None, None, None)
+        _FFPROBE_CACHE[key] = probe
+        return probe
 
     is_audio = False
     is_whisper_ready = False
+    media_format = None
+    codec_name = None
+    sample_rate = None
+    channels = None
     try:
         payload = json.loads(result.stdout)
         streams = payload.get("streams", [])
@@ -284,14 +312,22 @@ def _probe_media(path: Path) -> tuple[bool, bool]:
             is_audio = stream.get("codec_type") == "audio" or "codec_type" not in stream
             channels = int(stream.get("channels", 0))
             sample_rate = int(stream.get("sample_rate", 0))
-            codec_name = stream.get("codec_name", "")
+            codec_name = str(stream.get("codec_name", "")) or None
             is_whisper_ready = is_audio and channels == 1 and sample_rate == 16_000 and str(codec_name).startswith("pcm")
+            format_record = payload.get("format", {})
+            if isinstance(format_record, dict):
+                media_format = str(format_record.get("format_name", "")) or None
     except (TypeError, ValueError, json.JSONDecodeError):
         is_audio = False
         is_whisper_ready = False
+        media_format = None
+        codec_name = None
+        sample_rate = None
+        channels = None
 
-    _FFPROBE_CACHE[key] = (is_audio, is_whisper_ready)
-    return is_audio, is_whisper_ready
+    probe = MediaProbe(is_audio, is_whisper_ready, media_format, codec_name, sample_rate, channels)
+    _FFPROBE_CACHE[key] = probe
+    return probe
 
 
 def _can_use_source_audio_directly(path: Path) -> bool:

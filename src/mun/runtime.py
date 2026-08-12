@@ -8,7 +8,15 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Protocol
 
-from .core import Segment, Transcript, TranscriptionOptions, _audio_input_path, _cached_binary_path, _can_use_source_audio_directly
+from .core import (
+    Segment,
+    Transcript,
+    TranscriptionOptions,
+    _audio_input_path,
+    _cached_binary_path,
+    _can_use_source_audio_directly,
+    _probe_media_details,
+)
 from .errors import MunError
 from .models import InstalledModel, verify_installed_model
 from .transcript import ConverterIdentity, ModelTrust, PreparedMediaRecord
@@ -170,11 +178,13 @@ def ffmpeg_version() -> str | None:
 
 
 def _prepared_media_record(path: Path, *, used: bool) -> PreparedMediaRecord:
+    probe = None if used else _probe_media_details(path)
     return PreparedMediaRecord(
         used=used,
         sha256=_sha256_file(path),
-        media_format="wav",
-        sample_rate_hz=16_000,
-        channels=1,
+        media_format="wav" if used else probe.media_format,
+        codec="pcm_s16le" if used else probe.codec,
+        sample_rate_hz=16_000 if used else probe.sample_rate_hz,
+        channels=1 if used else probe.channels,
         converter=ConverterIdentity("ffmpeg", ffmpeg_version()) if used else None,
     )

@@ -131,6 +131,7 @@ class PreparedMediaRecord:
     used: bool
     sha256: str | None
     media_format: str | None
+    codec: str | None
     sample_rate_hz: int | None
     channels: int | None
     converter: ConverterIdentity | None
@@ -361,6 +362,7 @@ def _operation_from_dict(payload: dict[str, Any]) -> OperationRecord:
             used=prepared["used"],
             sha256=prepared.get("sha256"),
             media_format=prepared.get("media_format"),
+            codec=prepared.get("codec"),
             sample_rate_hz=prepared.get("sample_rate_hz"),
             channels=prepared.get("channels"),
             converter=ConverterIdentity(**converter) if converter is not None else None,
