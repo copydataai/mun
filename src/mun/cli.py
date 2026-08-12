@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .acceptance import create_acceptance
+from .artifacts import canonical_json_bytes
 from .config import config_path, load_config, reset_config, set_config
 from .core import (
     TranscriptionOptions,
@@ -120,6 +122,11 @@ def build_parser() -> argparse.ArgumentParser:
     review_render.add_argument("--view", choices=("machine", "corrected"), default="machine")
     review_render.add_argument("--format", choices=("txt", "json", "srt", "vtt"), default="txt")
     review_render.add_argument("-o", "--output", type=Path, help="write the projection to a file")
+    review_accept = review_subcommands.add_parser("accept", help="create a source-grounded acceptance artifact")
+    review_accept.add_argument("machine", type=Path, help="canonical machine-result JSON")
+    review_accept.add_argument("overlay", type=Path, help="segment-disposition overlay JSON")
+    review_accept.add_argument("--policy", type=Path, required=True, help="acceptance policy and bounded waivers JSON")
+    review_accept.add_argument("-o", "--output", type=Path, required=True, help="acceptance artifact JSON")
 
     replay = subcommands.add_parser("replay", help="verify a transcript result by bounded replay")
     replay.add_argument("result", type=Path, help="canonical transcript result JSON")
@@ -292,6 +299,19 @@ def command_transcribe(args: argparse.Namespace) -> int:
 
 def command_review(args: argparse.Namespace) -> int:
     machine = _read_machine_result(args.machine)
+    if args.review_command == "accept":
+        try:
+            overlay = json.loads(args.overlay.read_text(encoding="utf-8"))
+            policy = json.loads(args.policy.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise MunError("Cannot read acceptance overlay or policy JSON") from exc
+        artifact, receipt = create_acceptance(machine, overlay, policy)
+        receipt_path = args.output.with_name(args.output.name + ".receipt.json")
+        if args.output.exists() or receipt_path.exists():
+            raise MunError("Refusing to overwrite an existing acceptance artifact or receipt")
+        args.output.write_bytes(canonical_json_bytes(artifact) + b"\n")
+        receipt_path.write_bytes(canonical_json_bytes(receipt) + b"\n")
+        return 0
     if args.review_command == "apply":
         corrected = apply_corrections(machine, _read_correction_set(args.corrections))
         try:

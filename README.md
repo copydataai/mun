@@ -157,6 +157,18 @@ rewritten. Corrected TXT, SRT, and VTT retain the machine segment timings, while
 corrected JSON records `reviewed` or `unreviewed`, the parent and correction-set
 identities, and a distinct export digest.
 
+Create a fail-closed, source-grounded acceptance artifact from explicit segment
+dispositions and a policy containing any bounded, reasoned waivers:
+
+```sh
+mun review accept transcript.json decisions.json --policy acceptance-policy.json -o transcript.accepted.json
+```
+
+Mun writes canonical JSON and an adjacent `.receipt.json` binding the source,
+machine result, overlay, policy, and projections. Acceptance preserves transcript
+taint and agent ineligibility. It authenticates no human and makes no claim of
+truth, consent, custody, or reviewer identity.
+
 ### Understand deletion receipts
 
 Model removal prints a receipt with the exact managed path attempted, the app-visible result, and estimated bytes removed. Transient download cleanup uses the same scoped receipt contract. Receipts do not claim universal erasure. They explicitly exclude backups, APFS snapshots, swap, filesystem remnants, transcript exports, and third-party caches. Mun refuses deletion requests outside its managed model directory.
