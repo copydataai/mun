@@ -24,6 +24,7 @@ from .core import (
     run_transcription_workflow,
 )
 from .errors import MunError
+from .qualification import create_qualification_record
 from .review import CorrectionError, CorrectionSet, apply_corrections, render_reviewed
 from .replay import ReplayOutcome, replay_result
 from .transcript import TranscriptResult, make_batch_result
@@ -125,6 +126,10 @@ def build_parser() -> argparse.ArgumentParser:
     replay.add_argument("--model-dir", help="managed model directory")
     replay.add_argument("--tolerances", type=Path, help="explicit live-model tolerance JSON")
 
+    qualify = subcommands.add_parser("qualify", help="create an unsigned local exact-tuple qualification record")
+    qualify.add_argument("manifest", type=Path, help="physical-run manifest JSON")
+    qualify.add_argument("-o", "--output", type=Path, required=True, help="qualification record JSON")
+
     doctor = subcommands.add_parser("doctor", help="diagnose the local runtime")
     doctor.add_argument("--json", action="store_true")
     return parser
@@ -150,6 +155,8 @@ def main(argv: list[str] | None = None) -> int:
             return command_review(args)
         if args.command == "replay":
             return command_replay(args)
+        if args.command == "qualify":
+            return command_qualify(args)
         if args.command == "doctor":
             return command_doctor(args)
         parser.print_help()
@@ -332,6 +339,20 @@ def command_replay(args: argparse.Namespace) -> int:
     if outcome.kind == "unsupported_replay":
         return 2
     return 1
+
+
+def command_qualify(args: argparse.Namespace) -> int:
+    try:
+        manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise MunError(f"Cannot read qualification manifest {args.manifest}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise MunError(f"Invalid qualification manifest {args.manifest}: {exc}") from exc
+    record = create_qualification_record(manifest, base_dir=args.manifest.parent)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"Wrote unsigned local qualification record to {args.output}")
+    return 0
 
 
 def _read_machine_result(path: Path) -> TranscriptResult:

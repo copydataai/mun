@@ -74,6 +74,13 @@ First load can promote only the attempted runtime/device tuple to
 `load-verified`. Only reviewed compatibility-matrix evidence grants `tested`.
 Unknown and failed are not synonyms for unsupported.
 
+Exact-tuple evidence is represented by the qualification record documented in
+`docs/qualification/README.md`. The tuple includes immutable model and runtime
+manifest digests, physical device identity, effective precision, platform,
+fixture hashes, and capability outcomes. A material tuple change or elapsed
+expiry invalidates the row. Metadata, loading, or a device probe alone never
+produces `tested`, and a qualification record makes no model-quality claim.
+
 Consequently, the current single global model `status` should become an
 installation-integrity status plus per-runtime/device validation records. A
 CUDA out-of-memory error, unsupported MPS operation, or missing optional

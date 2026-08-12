@@ -208,6 +208,18 @@ mun models remove OWNER/MODEL
 
 Search is discovery, not qualification. It reports repository metadata such as model ID, library, gating, and popularity, but does not label a model `eligible` or `tested` without the exact revision, runtime, device, precision, and requested capability tuple required to support that claim.
 
+Physical qualification operators can turn a completed run manifest into an
+unsigned local evidence record:
+
+```sh
+mun qualify run-manifest.json -o qualification.json
+```
+
+The command hashes fixtures and records the exact machine/runtime/model tuple,
+device and precision, cold/warm timing, measurable peak memory, capability
+outcomes, status, and expiry. It does not run hardware tests or publish a claim.
+See [the qualification record guide](docs/qualification/README.md).
+
 `gated` is visible in search results when downloading requires upstream terms and Hugging Face authentication. `installed` appears in `mun models list` only after pinned artifacts are present locally.
 
 Mun does not present model-card metrics as comparable accuracy scores. Datasets, languages, preprocessing, and metrics differ too much for that claim.
