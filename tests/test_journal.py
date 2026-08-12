@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from dataclasses import replace
@@ -53,6 +54,81 @@ class JournalTests(unittest.TestCase):
             self.assertEqual(txt_path.read_text(encoding="utf-8"), "Recovered\n")
             self.assertEqual(first, second)
             self.assertEqual(first["sources"][0]["classification"], "verified-complete")
+
+    @unittest.skipUnless(Path("/var").resolve() == Path("/private/var"), "requires the macOS /var alias")
+    def test_partial_commit_resume_matches_var_and_private_var_paths(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as temporary:
+            alias_root = Path(temporary)
+            journal_path, runtime = self._partial_commit(alias_root)
+            payload = json.loads(journal_path.read_text(encoding="utf-8"))
+            evidence = payload["sources"][0]["evidence"]
+
+            self.assertTrue(evidence["committed"][0].startswith("/private/var/"))
+            resumed = resume_batch_journal(journal_path, runtime_loader=lambda _model, _device: runtime)
+
+            self.assertEqual(resumed["sources"][0]["classification"], "verified-complete")
+
+    def test_partial_commit_resume_normalizes_legacy_symlink_alias_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            container = Path(temporary)
+            real_root = container / "real"
+            real_root.mkdir()
+            alias_root = container / "alias"
+            os.symlink(real_root, alias_root)
+            journal_path, runtime = self._partial_commit(real_root)
+            payload = json.loads(journal_path.read_text(encoding="utf-8"))
+            evidence = payload["sources"][0]["evidence"]
+            real_prefix = str(real_root.resolve())
+            alias_prefix = str(alias_root)
+            for artifact in evidence["artifacts"]:
+                artifact["path"] = artifact["path"].replace(real_prefix, alias_prefix, 1)
+            evidence["committed"] = [path.replace(real_prefix, alias_prefix, 1) for path in evidence["committed"]]
+            journal_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            resumed = resume_batch_journal(journal_path, runtime_loader=lambda _model, _device: runtime)
+
+            self.assertEqual(resumed["sources"][0]["classification"], "verified-complete")
+            self.assertEqual((real_root / "out" / "source.txt").read_text(encoding="utf-8"), "Recovered\n")
+
+    def test_partial_commit_resume_rejects_conflicting_bytes_through_legacy_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            container = Path(temporary)
+            real_root = container / "real"
+            real_root.mkdir()
+            alias_root = container / "alias"
+            os.symlink(real_root, alias_root)
+            journal_path, runtime = self._partial_commit(real_root)
+            payload = json.loads(journal_path.read_text(encoding="utf-8"))
+            evidence = payload["sources"][0]["evidence"]
+            real_prefix = str(real_root.resolve())
+            alias_prefix = str(alias_root)
+            for artifact in evidence["artifacts"]:
+                artifact["path"] = artifact["path"].replace(real_prefix, alias_prefix, 1)
+            evidence["committed"] = [path.replace(real_prefix, alias_prefix, 1) for path in evidence["committed"]]
+            journal_path.write_text(json.dumps(payload), encoding="utf-8")
+            json_path = real_root / "out" / "source.json"
+            json_path.write_bytes(b'{"conflict":true}\n')
+
+            with self.assertRaises(JournalError):
+                resume_batch_journal(journal_path, runtime_loader=lambda _model, _device: runtime)
+
+            self.assertFalse((real_root / "out" / "source.txt").exists())
+
+    def test_partial_commit_resume_rejects_output_symlink_even_when_target_bytes_match(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            journal_path, runtime = self._partial_commit(root)
+            json_path = root / "out" / "source.json"
+            outside = root / "outside.json"
+            outside.write_bytes(json_path.read_bytes())
+            json_path.unlink()
+            os.symlink(outside, json_path)
+
+            with self.assertRaises(JournalError):
+                resume_batch_journal(journal_path, runtime_loader=lambda _model, _device: runtime)
+
+            self.assertTrue(json_path.is_symlink())
+            self.assertFalse((root / "out" / "source.txt").exists())
 
     def test_partial_commit_resume_verifies_json_from_journal_payload_despite_restored_runtime_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

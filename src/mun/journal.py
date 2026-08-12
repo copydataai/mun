@@ -126,7 +126,7 @@ def resume_batch_journal(
     path: Path,
     runtime_loader: Callable[[Any, str], Any] | None = None,
 ) -> dict[str, Any]:
-    from .core import SourceMedia, TranscriptionOptions, transcribe_source, write_result_outputs
+    from .core import canonical_export_path, SourceMedia, TranscriptionOptions, transcribe_source, write_result_outputs
     from .models import InstalledModel
     from .runtime import create_transformers_runtime
     from .transcript import TranscriptResult
@@ -198,19 +198,29 @@ def resume_batch_journal(
             or not isinstance(artifacts, list)
         ):
             raise JournalError("Partial commit evidence cannot verify committed projections")
-        artifact_digests = {
-            artifact["path"]: artifact["sha256"]
-            for artifact in artifacts
-            if isinstance(artifact, Mapping)
-            and isinstance(artifact.get("path"), str)
-            and isinstance(artifact.get("sha256"), str)
-        }
-        resumable = {
-            committed_path: artifact_digests[committed_path]
-            for committed_path in committed
-            if isinstance(committed_path, str) and committed_path in artifact_digests
-        }
+        artifact_digests: dict[str, str] = {}
+        ambiguous_artifacts = False
+        for artifact in artifacts:
+            if not isinstance(artifact, Mapping):
+                continue
+            artifact_path = artifact.get("path")
+            artifact_digest = artifact.get("sha256")
+            if not isinstance(artifact_path, str) or not isinstance(artifact_digest, str):
+                continue
+            identity = canonical_export_path(Path(artifact_path))
+            if identity in artifact_digests and artifact_digests[identity] != artifact_digest:
+                ambiguous_artifacts = True
+            artifact_digests[identity] = artifact_digest
+        resumable = {}
+        for committed_path in committed:
+            if not isinstance(committed_path, str):
+                continue
+            identity = canonical_export_path(Path(committed_path))
+            if identity in artifact_digests:
+                resumable[identity] = artifact_digests[identity]
         if outcome["state"] == "partial_commit" and len(resumable) != len(committed):
+            raise JournalError("Partial commit evidence cannot verify committed projections")
+        if outcome["state"] == "partial_commit" and ambiguous_artifacts:
             raise JournalError("Partial commit evidence cannot verify committed projections")
 
         def transition(state: str, update: dict[str, Any]) -> None:

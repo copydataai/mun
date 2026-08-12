@@ -1025,6 +1025,11 @@ def output_paths(base: Path, formats: list[str], translated: bool) -> list[Path]
     return paths
 
 
+def canonical_export_path(path: Path) -> str:
+    """Return stable path identity without resolving the output leaf itself."""
+    return str(path.parent.resolve() / path.name)
+
+
 def write_outputs(
     base: Path,
     formats: list[str],
@@ -1097,7 +1102,10 @@ def write_result_outputs(
         )
         _atomic_write(receipt_path, receipt.to_json())
 
-    resumable = resume_artifacts or {}
+    resumable = {
+        canonical_export_path(Path(path)): digest
+        for path, digest in (resume_artifacts or {}).items()
+    }
     resuming = resume_artifacts is not None
 
     base.parent.mkdir(parents=True, exist_ok=True)
@@ -1126,15 +1134,20 @@ def write_result_outputs(
             artifacts.append(ExportArtifact(str(destination), digest, staged_path.stat().st_size))
             staged.append((staged_path, destination))
 
-        expected_digests = {artifact.path: artifact.sha256 for artifact in artifacts}
+        expected_digests = {
+            canonical_export_path(Path(artifact.path)): artifact.sha256
+            for artifact in artifacts
+        }
         conflicting = []
         for destination in destinations:
             if not destination.exists():
                 continue
-            expected_digest = expected_digests[str(destination)]
+            destination_id = canonical_export_path(destination)
+            expected_digest = expected_digests[destination_id]
             verified_resume = (
                 resuming
-                and resumable.get(str(destination)) == expected_digest
+                and not destination.is_symlink()
+                and resumable.get(destination_id) == expected_digest
                 and _sha256_file(destination) == expected_digest
             )
             if not verified_resume and (resuming or not overwrite):
@@ -1146,12 +1159,20 @@ def write_result_outputs(
         if transition:
             transition("render_staged", {
                 "result": result.to_dict(),
-                "artifacts": [asdict(artifact) for artifact in artifacts],
+                "artifacts": [
+                    {**asdict(artifact), "path": canonical_export_path(Path(artifact.path))}
+                    for artifact in artifacts
+                ],
             })
 
         for staged_path, destination in staged:
-            expected_digest = next(artifact.sha256 for artifact in artifacts if artifact.path == str(destination))
-            if destination.exists() and resumable.get(str(destination)) == expected_digest:
+            destination_id = canonical_export_path(destination)
+            expected_digest = expected_digests[destination_id]
+            if (
+                destination.exists()
+                and not destination.is_symlink()
+                and resumable.get(destination_id) == expected_digest
+            ):
                 committed.append(destination)
                 continue
             try:
@@ -1165,9 +1186,12 @@ def write_result_outputs(
             if transition and len(committed) < len(destinations):
                 transition("partial_commit", {
                     "result": result.to_dict(),
-                    "artifacts": [asdict(artifact) for artifact in artifacts],
-                    "committed": [str(path) for path in committed],
-                    "uncommitted": [str(path) for path in destinations if path not in committed],
+                    "artifacts": [
+                        {**asdict(artifact), "path": canonical_export_path(Path(artifact.path))}
+                        for artifact in artifacts
+                    ],
+                    "committed": [canonical_export_path(path) for path in committed],
+                    "uncommitted": [canonical_export_path(path) for path in destinations if path not in committed],
                 })
         persist_receipt("completed")
         return requested_destinations
