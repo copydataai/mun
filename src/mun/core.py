@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import platform
 import shutil
+import sys
 from importlib.metadata import PackageNotFoundError, version as package_version
 import subprocess
 import tempfile
@@ -14,7 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from .errors import MunError
-from .models import InstalledModel
+from .models import InstalledModel, VerificationResult, verify_installed_model
 from . import __version__
 from .transcript import (
     SCHEMA_VERSION,
@@ -232,18 +234,39 @@ def _matches_reuse_identity(
     model: InstalledModel,
     options: TranscriptionOptions,
     source_sha256: str | None,
+    artifact_sha256: str,
+    runtime: Any,
 ) -> bool:
     operation = result.operation
     if result.result_digest is None or operation is None:
         return False
     parameters = operation.parameters
+    provenance = result.provenance
+    environment = provenance.runtime.environment
+    info = runtime.info
+    runtime_artifact_sha256 = getattr(runtime, "model_artifact_sha256", artifact_sha256)
     return (
         result.status == "completed"
         and result.source.name == media.source.name
         and result.source.relative_path == str(media.relative)
         and result.source.sha256 == source_sha256
-        and result.provenance.model.repository == model.id
-        and result.provenance.model.revision == model.revision
+        and provenance.model.repository == model.id
+        and provenance.model.revision == model.revision
+        and provenance.model.artifact_sha256 == artifact_sha256
+        and runtime_artifact_sha256 == artifact_sha256
+        and result.trust.model == ("unsafe_remote_code" if model.trust_remote_code else "verified_artifact")
+        and provenance.runtime.name == info.name
+        and provenance.runtime.version == info.version
+        and environment is not None
+        and (
+            environment.python_version,
+            environment.python_implementation,
+            environment.operating_system,
+            environment.machine,
+        ) == (platform.python_version(), platform.python_implementation(), sys.platform, platform.machine())
+        and provenance.requested_device == options.device
+        and provenance.effective_device == info.effective_device
+        and provenance.precision == info.precision
         and operation.source_hash_policy == SOURCE_HASH_POLICY
         and parameters.language == options.language
         and parameters.timestamps == options.timestamps
@@ -251,6 +274,8 @@ def _matches_reuse_identity(
         and parameters.chunk_length == options.chunk_length
         and parameters.stride_length == options.stride_length
         and parameters.requested_device == options.device
+        and parameters.effective_device == info.effective_device
+        and parameters.precision == info.precision
     )
 
 
@@ -260,12 +285,16 @@ def _load_reusable_result(
     media: SourceMedia,
     model: InstalledModel,
     options: TranscriptionOptions,
+    artifact_sha256: str,
+    runtime: Any,
 ) -> TranscriptResult | None:
     try:
         result = TranscriptResult.from_json(json_path.read_text(encoding="utf-8"))
     except (OSError, TypeError, ValueError, KeyError):
         return None
-    if not _matches_reuse_identity(result, media, model, options, _sha256_file(media.source)):
+    if not _matches_reuse_identity(
+        result, media, model, options, _sha256_file(media.source), artifact_sha256, runtime
+    ):
         return None
     for path in expected_paths:
         if path == json_path:
@@ -522,6 +551,8 @@ def run_batch(
     queued: list[tuple[int, SourceMedia, Path]] = []
     queued_status: dict[int, ReuseStatus] = {}
     queued_results: dict[int, TranscriptResult] = {}
+    model_verification: VerificationResult | None = None
+    reuse_runtime = runtime
 
     for index, item in enumerate(media, start=1):
         base = output_base(output_dir, item, used_bases)
@@ -544,7 +575,30 @@ def run_batch(
             progress(f"[{index}/{len(media)}] blocked {item.source} (incomplete output set)")
             continue
         json_path = next((path for path in expected if path.suffix == ".json"), None)
-        reused = _load_reusable_result(json_path, expected, item, model, options) if json_path is not None else None
+        reused = None
+        if json_path is not None:
+            if model_verification is None:
+                model_verification = verify_installed_model(model)
+            if reuse_runtime is None:
+                try:
+                    reuse_effective_device = _infer_effective_device(options.device)
+                    reuse_runtime = _batch_provenance_runtime(options.device, reuse_effective_device)
+                except MunError:
+                    reuse_runtime = None
+            if (
+                model_verification.status in {"verified", "unsafe_remote_code"}
+                and model_verification.artifact_digest is not None
+                and reuse_runtime is not None
+            ):
+                reused = _load_reusable_result(
+                    json_path,
+                    expected,
+                    item,
+                    model,
+                    options,
+                    model_verification.artifact_digest,
+                    reuse_runtime,
+                )
         if reused is not None:
             queued_results[index] = reused
             progress(f"[{index}/{len(media)}] reused {item.source} (verified canonical JSON)")

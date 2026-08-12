@@ -4,6 +4,7 @@ import json
 import hashlib
 import unittest
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -21,7 +22,7 @@ from mun.core import (
     run_transcription_workflow,
     write_result_outputs,
 )
-from mun.models import InstalledModel
+from mun.models import InstalledModel, VerificationResult
 from mun.runtime import FakeSpeechRuntime
 from mun.artifacts import ArtifactValidationError
 from mun.transcript import TranscriptResult, make_batch_result
@@ -32,6 +33,7 @@ class TranscriptContractTests(unittest.TestCase):
         self.model = InstalledModel("example/model", "abc123", "/models/example", "2026-08-09T00:00:00+00:00")
         self.media = SourceMedia(Path("/private/source.wav"), Path("batch/source.wav"))
         self.runtime = FakeSpeechRuntime(Transcript("Hello world", [Segment("Hello", 0.0, 1.25)], "en"))
+        self.runtime.model_artifact_sha256 = "a" * 64
 
     def test_workflow_returns_canonical_result(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -488,7 +490,8 @@ class TranscriptContractTests(unittest.TestCase):
                 [media], self.model, TranscriptionOptions(), runtime=self.runtime
             )[0]
             (Path(temporary) / "file.json").write_text(canonical.to_json(), encoding="utf-8")
-            with patch("mun.core.load_pipeline") as load_pipeline:
+            with patch("mun.core.verify_installed_model", return_value=VerificationResult("verified", "a" * 64)), \
+                patch("mun.core.load_pipeline") as load_pipeline:
                 summaries, failures = run_batch(
                     [media],
                     self.model,
@@ -497,6 +500,7 @@ class TranscriptContractTests(unittest.TestCase):
                     TranscriptionOptions(),
                     False,
                     lambda _: None,
+                    runtime=self.runtime,
                     jobs=4,
                 )
             self.assertEqual(load_pipeline.call_count, 0)
@@ -504,6 +508,47 @@ class TranscriptContractTests(unittest.TestCase):
             self.assertEqual(summaries[0].reuse_status, "reused_verified")
             self.assertEqual(summaries[0].transcripts[0].text, "Hello world")
             self.assertEqual(failures, [])
+
+    def test_same_repository_and_revision_with_changed_artifact_rejects_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "file.wav"
+            source.write_bytes(b"audio")
+            media = SourceMedia(source, Path(source.name))
+            canonical = run_transcription_workflow(
+                [media], self.model, TranscriptionOptions(), runtime=self.runtime
+            )[0]
+            (Path(temporary) / "file.json").write_text(canonical.to_json(), encoding="utf-8")
+
+            with patch("mun.core.verify_installed_model", return_value=VerificationResult("verified", "b" * 64)):
+                summaries, failures = run_batch(
+                    [media], self.model, Path(temporary), ["json"], TranscriptionOptions(), False,
+                    lambda _: None, runtime=self.runtime,
+                )
+
+        self.assertEqual(summaries[0].reuse_status, "conflict")
+        self.assertEqual(len(failures), 1)
+
+    def test_runtime_tuple_mismatch_rejects_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "file.wav"
+            source.write_bytes(b"audio")
+            media = SourceMedia(source, Path(source.name))
+            canonical = run_transcription_workflow(
+                [media], self.model, TranscriptionOptions(), runtime=self.runtime
+            )[0]
+            (Path(temporary) / "file.json").write_text(canonical.to_json(), encoding="utf-8")
+            changed_runtime = FakeSpeechRuntime(Transcript("unused", [], "en"))
+            changed_runtime.info = replace(changed_runtime.info, version="changed-runtime")
+            changed_runtime.model_artifact_sha256 = "a" * 64
+
+            with patch("mun.core.verify_installed_model", return_value=VerificationResult("verified", "a" * 64)):
+                summaries, failures = run_batch(
+                    [media], self.model, Path(temporary), ["json"], TranscriptionOptions(), False,
+                    lambda _: None, runtime=changed_runtime,
+                )
+
+        self.assertEqual(summaries[0].reuse_status, "conflict")
+        self.assertEqual(len(failures), 1)
 
     def test_changed_source_or_parameters_reject_reuse(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
