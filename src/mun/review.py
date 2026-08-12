@@ -132,6 +132,41 @@ class CorrectedTranscript:
         return json.dumps(self.to_dict(), ensure_ascii=False, indent=2) + "\n"
 
 
+@dataclass(frozen=True)
+class ReviewedProjectionReceipt:
+    schema_version: int
+    view: ReviewView
+    review_state: ReviewState
+    parent_result_digest: str
+    correction_set_id: str
+    correction_set_digest: str
+    renderer_parameters: dict[str, str]
+    output_byte_digest: str
+    output_path: dict[str, str]
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self), ensure_ascii=False, indent=2) + "\n"
+
+
+def reviewed_projection_receipt(
+    format_name: str,
+    corrected: CorrectedTranscript,
+    output_bytes: bytes,
+    output_name: str,
+) -> ReviewedProjectionReceipt:
+    return ReviewedProjectionReceipt(
+        schema_version=1,
+        view="corrected",
+        review_state=corrected.review_state,
+        parent_result_digest=corrected.parent_result_digest,
+        correction_set_id=corrected.correction_set_id,
+        correction_set_digest=corrected.correction_set_digest,
+        renderer_parameters={"format": format_name, "encoding": "utf-8", "newline": "lf"},
+        output_byte_digest=sha256(output_bytes).hexdigest(),
+        output_path={"name": output_name},
+    )
+
+
 def apply_corrections(machine: TranscriptResult, correction_set: CorrectionSet) -> CorrectedTranscript:
     if machine.result_digest is None or correction_set.parent_result_digest != machine.result_digest:
         raise CorrectionError("Correction set does not match the exact parent machine result")

@@ -25,7 +25,7 @@ from .core import (
 )
 from .errors import MunError
 from .qualification import create_qualification_record
-from .review import CorrectionError, CorrectionSet, apply_corrections, render_reviewed
+from .review import CorrectionError, CorrectionSet, apply_corrections, render_reviewed, reviewed_projection_receipt
 from .replay import ReplayOutcome, replay_result
 from .transcript import TranscriptResult, make_batch_result
 from .models import (
@@ -119,6 +119,7 @@ def build_parser() -> argparse.ArgumentParser:
     review_render.add_argument("--corrections", type=Path, help="correction-set JSON")
     review_render.add_argument("--view", choices=("machine", "corrected"), default="machine")
     review_render.add_argument("--format", choices=("txt", "json", "srt", "vtt"), default="txt")
+    review_render.add_argument("-o", "--output", type=Path, help="write the projection to a file")
 
     replay = subcommands.add_parser("replay", help="verify a transcript result by bounded replay")
     replay.add_argument("result", type=Path, help="canonical transcript result JSON")
@@ -307,7 +308,25 @@ def command_review(args: argparse.Namespace) -> int:
         if args.corrections is None:
             raise CorrectionError("--corrections is required for corrected rendering")
         corrected = apply_corrections(machine, _read_correction_set(args.corrections))
-    sys.stdout.write(render_reviewed(args.format, machine, corrected, args.view))
+    rendered = render_reviewed(args.format, machine, corrected, args.view)
+    if args.output is None:
+        sys.stdout.write(rendered)
+        return 0
+
+    receipt_path = Path(f"{args.output}.receipt.json")
+    existing = next((path for path in (args.output, receipt_path) if path.exists()), None)
+    if existing is not None:
+        raise MunError(f"Refusing to overwrite existing reviewed export: {existing}")
+    output_bytes = rendered.encode("utf-8")
+    try:
+        with args.output.open("xb") as handle:
+            handle.write(output_bytes)
+        if corrected is not None:
+            receipt = reviewed_projection_receipt(args.format, corrected, output_bytes, args.output.name)
+            with receipt_path.open("x", encoding="utf-8", newline="\n") as handle:
+                handle.write(receipt.to_json())
+    except OSError as exc:
+        raise MunError(f"Cannot write reviewed export {args.output}: {exc}") from exc
     return 0
 
 

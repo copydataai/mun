@@ -207,6 +207,14 @@ Corrected TXT, SRT, and VTT select replacement text while retaining the machine
 segments' IDs, ordering, speakers, and timing intervals. The variant-level text
 is rebuilt from the corrected segments in source order.
 
+When a corrected projection is written to a file, Mun writes an adjacent
+`<projection>.receipt.json`. The receipt identifies the corrected view and
+review state, parent result digest, correction-set ID and digest, renderer
+parameters, SHA-256 digest of the exact projection bytes, and the destination
+file name without exposing parent directories. Corrected JSON retains the same
+identity and review metadata in its envelope and uses the same adjacent receipt
+shape when rendered to a file.
+
 Human review records that a person handled the correction set. It does not
 establish truth, authenticity, honesty, semantic accuracy, consent, custody, or
 producer identity.

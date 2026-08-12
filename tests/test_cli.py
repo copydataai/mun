@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import io
 import json
 import tempfile
@@ -63,6 +64,54 @@ class CliTests(unittest.TestCase):
             self.assertEqual(output.getvalue(), "Hello world. Next line.\n")
             self.assertEqual(machine.read_bytes(), original_bytes)
             self.assertEqual(json.loads(corrected.read_text(encoding="utf-8"))["review_state"], "reviewed")
+
+    def test_corrected_projection_writes_adjacent_identity_receipt(self) -> None:
+        from tests.test_review import correction_payload, machine_result
+        from mun.review import CorrectionSet
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            machine = root / "machine.json"
+            corrections = root / "corrections.json"
+            result = machine_result()
+            machine.write_text(result.to_json(), encoding="utf-8")
+            correction_json = json.dumps(correction_payload(result))
+            corrections.write_text(correction_json, encoding="utf-8")
+            correction_digest = CorrectionSet.from_json(correction_json).digest
+            expected_by_format = {
+                "txt": b"Hello world. Next line.\n",
+                "srt": (
+                    "1\n00:00:00,000 --> 00:00:01,250\nHello world.\n\n"
+                    "2\n00:00:01,250 --> 00:00:02,400\nNext line.\n"
+                ).encode(),
+                "vtt": (
+                    "WEBVTT\n\n00:00:00.000 --> 00:00:01.250\nHello world.\n\n"
+                    "00:00:01.250 --> 00:00:02.400\nNext line.\n"
+                ).encode(),
+            }
+
+            for format_name, expected in expected_by_format.items():
+                with self.subTest(format=format_name):
+                    output = root / f"reviewed.{format_name}"
+                    status = main([
+                        "review", "render", str(machine), "--corrections", str(corrections),
+                        "--view", "corrected", "--format", format_name, "--output", str(output),
+                    ])
+
+                    receipt = json.loads(Path(f"{output}.receipt.json").read_text(encoding="utf-8"))
+                    self.assertEqual(status, 0)
+                    self.assertEqual(output.read_bytes(), expected)
+                    self.assertEqual(receipt["view"], "corrected")
+                    self.assertEqual(receipt["review_state"], "reviewed")
+                    self.assertEqual(receipt["parent_result_digest"], result.result_digest)
+                    self.assertEqual(receipt["correction_set_id"], "review-2026-08-12-a")
+                    self.assertEqual(receipt["correction_set_digest"], correction_digest)
+                    self.assertEqual(
+                        receipt["renderer_parameters"],
+                        {"format": format_name, "encoding": "utf-8", "newline": "lf"},
+                    )
+                    self.assertEqual(receipt["output_byte_digest"], hashlib.sha256(expected).hexdigest())
+                    self.assertEqual(receipt["output_path"], {"name": f"reviewed.{format_name}"})
 
     def test_guided_workflow_uses_an_installed_model_without_downloading_again(self) -> None:
         model = InstalledModel(
