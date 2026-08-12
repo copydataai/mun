@@ -189,6 +189,13 @@ or indeterminate. Partial or unverifiable projections are never silently reused.
 
 Model removal prints a receipt with the exact managed path attempted, the app-visible result, and estimated bytes removed. Transient download cleanup uses the same scoped receipt contract. Receipts do not claim universal erasure. They explicitly exclude backups, APFS snapshots, swap, filesystem remnants, transcript exports, and third-party caches. Mun refuses deletion requests outside its managed model directory.
 
+FFmpeg, ffprobe, and helper execution use argv-only invocation, a sanitized
+environment, closed stdin, bounded captured output, wall-clock timeouts,
+process-group cancellation, managed-output checks, and POSIX resource limits
+where available. Receipts call this containment, not a sandbox. Kernel and
+decoder defects, swap, filesystem remnants, and acknowledged remote model code
+remain outside guarantees enforceable by this process.
+
 ### Verify a transcript with bounded replay
 
 ```sh
@@ -214,7 +221,10 @@ Each attempt persists `<name>.receipt.json` with one of `completed`, `cancelled`
 
 Batch summary counts distinguish newly processed files from `reused_verified`, `conflict`, `incomplete_output_set`, and `overwrite_required` plans. A verified reuse can succeed without loading the speech model. Conflicts and incomplete sets are recoverable by moving the existing files or rerunning with `--overwrite`.
 
-Artifact validation establishes internal consistency only. A matching digest proves that the JSON has not changed relative to its own recorded digest, not that the transcript was honestly produced, that the recorded provenance is true, or that a trusted producer signed it. Mun does not currently provide producer signatures.
+Artifact validation establishes internal consistency only. Optional producer
+authentication proves that canonical artifact and receipt bytes were signed by
+the holder of an Ed25519 key. It does not prove transcript truth, provenance
+truth, human identity, consent, custody, or authorization.
 
 Correction content and notes are untrusted data. A human review state records a
 workflow state only. It does not claim truth, authenticity, honesty, accuracy,

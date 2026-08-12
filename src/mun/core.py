@@ -7,7 +7,6 @@ import platform
 import shutil
 import sys
 from importlib.metadata import PackageNotFoundError, version as package_version
-import subprocess
 import tempfile
 from types import SimpleNamespace
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -16,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from .errors import MunError
+from .containment import ContainmentError, run_contained
 from .models import InstalledModel, VerificationResult, verify_installed_model
 from . import __version__
 from .transcript import (
@@ -381,17 +381,22 @@ def _probe_media_details(path: Path) -> MediaProbe:
         return cached
 
     ffprobe = _cached_binary_path("ffprobe", "FFprobe is not installed. Install FFmpeg and try again.")
-    result = subprocess.run(
+    try:
+        result = run_contained(
         [
             ffprobe, "-v", "error", "-select_streams", "a:0",
             "-show_entries", "stream=codec_name,channels,sample_rate:format=format_name",
             "-of", "json",
             str(path),
         ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+        expected_stdout="json",
+        timeout_seconds=30,
+        max_output_bytes=1024 * 1024,
+        )
+    except ContainmentError:
+        probe = MediaProbe(False, False, None, None, None, None)
+        _FFPROBE_CACHE[key] = probe
+        return probe
     if result.returncode != 0:
         probe = MediaProbe(False, False, None, None, None, None)
         _FFPROBE_CACHE[key] = probe
@@ -1107,15 +1112,19 @@ def _add_media(
 
 def _convert_media(source: Path, destination: Path) -> None:
     ffmpeg = _cached_binary_path("ffmpeg", "FFmpeg is not installed. Install FFmpeg and try again.")
-    result = subprocess.run(
+    try:
+        result = run_contained(
         [
             ffmpeg, "-nostdin", "-v", "error", "-i", str(source), "-map", "0:a:0",
             "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-y", str(destination),
         ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+        timeout_seconds=300,
+        max_output_bytes=1024 * 1024,
+        managed_root=destination.parent,
+        outputs=[destination],
+        )
+    except ContainmentError as exc:
+        raise MunError(f"Media conversion containment failed: {exc}") from exc
     if result.returncode != 0:
         message = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "unknown FFmpeg error"
         raise MunError(f"Media conversion failed: {message}")

@@ -179,7 +179,7 @@ class ProbeTests(unittest.TestCase):
                     ),
                 },
             )()
-            with patch("mun.core.subprocess.run", return_value=fake) as run_probe, patch(
+            with patch("mun.core.run_contained", return_value=fake) as run_probe, patch(
                 "shutil.which", return_value="/usr/bin/ffprobe"
             ):
                 runtime.transcribe(source, TranscriptionOptions())
@@ -205,7 +205,7 @@ class ProbeTests(unittest.TestCase):
 
             fake = type("Result", (), {"returncode": 0, "stdout": '{"streams": [{"codec_type": "audio", "codec_name": "pcm_s16le", "channels": 1, "sample_rate": "16000"}]}'})()
 
-            with patch("mun.core.subprocess.run", return_value=fake) as run_probe, patch("shutil.which", return_value="/usr/bin/ffprobe"):
+            with patch("mun.core.run_contained", return_value=fake) as run_probe, patch("shutil.which", return_value="/usr/bin/ffprobe"):
                 self.assertTrue(core.is_media(source))
                 self.assertTrue(core._can_use_source_audio_directly(source))
                 self.assertTrue(core.is_media(source))
@@ -254,7 +254,7 @@ class ProbeTests(unittest.TestCase):
             source.write_bytes(b"audio")
             fake = type("Result", (), {"returncode": 1, "stdout": ""})()
 
-            with patch("mun.core.subprocess.run", return_value=fake), patch("shutil.which", return_value="/usr/bin/ffprobe"):
+            with patch("mun.core.run_contained", return_value=fake), patch("shutil.which", return_value="/usr/bin/ffprobe"):
                 self.assertFalse(core.is_media(source))
                 self.assertFalse(core._can_use_source_audio_directly(source))
 
@@ -269,7 +269,7 @@ class ProbeTests(unittest.TestCase):
             source.write_bytes(b"audio")
             fake = type("Result", (), {"returncode": 0, "stdout": "this is not json"})()
 
-            with patch("mun.core.subprocess.run", return_value=fake), patch("shutil.which", return_value="/usr/bin/ffprobe"):
+            with patch("mun.core.run_contained", return_value=fake), patch("shutil.which", return_value="/usr/bin/ffprobe"):
                 self.assertFalse(core.is_media(source))
                 self.assertFalse(core._can_use_source_audio_directly(source))
 

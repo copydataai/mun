@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import subprocess
 import tempfile
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
@@ -18,6 +17,7 @@ from .core import (
     _probe_media_details,
 )
 from .errors import MunError
+from .containment import ContainmentError, run_contained
 from .models import InstalledModel, verify_installed_model
 from .transcript import ConverterIdentity, ModelTrust, PreparedMediaRecord
 
@@ -176,8 +176,8 @@ def _sha256_file(path: Path) -> str | None:
 def ffmpeg_version() -> str | None:
     try:
         ffmpeg = _cached_binary_path("ffmpeg", "FFmpeg is not installed. Install FFmpeg and try again.")
-        result = subprocess.run([ffmpeg, "-version"], capture_output=True, text=True, check=False)
-    except (MunError, OSError):
+        result = run_contained([ffmpeg, "-version"], timeout_seconds=10, max_output_bytes=64 * 1024)
+    except (MunError, OSError, ContainmentError):
         return None
     if result.returncode != 0 or not result.stdout.strip():
         return None
