@@ -16,6 +16,7 @@ from typing import Any
 from . import __version__
 from .acceptance import create_acceptance
 from .artifacts import canonical_json_bytes
+from .authentication import sign_artifact, verify_artifact
 from .config import config_path, load_config, reset_config, set_config
 from .core import (
     TranscriptionOptions,
@@ -138,6 +139,18 @@ def build_parser() -> argparse.ArgumentParser:
     qualify.add_argument("manifest", type=Path, help="physical-run manifest JSON")
     qualify.add_argument("-o", "--output", type=Path, required=True, help="qualification record JSON")
 
+    sign = subcommands.add_parser("sign", help="authenticate an acceptance artifact with a local Ed25519 key")
+    sign.add_argument("artifact", type=Path)
+    sign.add_argument("receipt", type=Path)
+    sign.add_argument("--key", type=Path, required=True, help="local PEM private key; never copied into Mun data")
+    sign.add_argument("--role", required=True, help="producer-declared role")
+    sign.add_argument("-o", "--output", type=Path, required=True)
+
+    verify = subcommands.add_parser("verify", help="verify producer authentication with machine-readable output")
+    verify.add_argument("artifact", type=Path)
+    verify.add_argument("receipt", type=Path)
+    verify.add_argument("envelope", type=Path)
+
     doctor = subcommands.add_parser("doctor", help="diagnose the local runtime")
     doctor.add_argument("--json", action="store_true")
     return parser
@@ -165,6 +178,20 @@ def main(argv: list[str] | None = None) -> int:
             return command_replay(args)
         if args.command == "qualify":
             return command_qualify(args)
+        if args.command == "sign":
+            artifact = json.loads(args.artifact.read_text(encoding="utf-8"))
+            receipt = json.loads(args.receipt.read_text(encoding="utf-8"))
+            envelope = sign_artifact(artifact, receipt, args.key.read_bytes(), args.role)
+            if args.output.exists():
+                raise MunError("Refusing to overwrite an authentication envelope")
+            args.output.write_bytes(canonical_json_bytes(envelope) + b"\n")
+            return 0
+        if args.command == "verify":
+            artifact = json.loads(args.artifact.read_text(encoding="utf-8"))
+            receipt = json.loads(args.receipt.read_text(encoding="utf-8"))
+            envelope = json.loads(args.envelope.read_text(encoding="utf-8"))
+            print(json.dumps(verify_artifact(artifact, receipt, envelope), sort_keys=True))
+            return 0
         if args.command == "doctor":
             return command_doctor(args)
         parser.print_help()

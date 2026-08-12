@@ -21,6 +21,7 @@ classifiers = [
   "Topic :: Multimedia :: Sound/Audio :: Speech",
 ]
 dependencies = [
+  "cryptography>=42,<47",
   "huggingface-hub>=0.34,<2",
   "torch>=2.2,<3",
   "transformers>=5.14,<6",

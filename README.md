@@ -169,6 +169,17 @@ machine result, overlay, policy, and projections. Acceptance preserves transcrip
 taint and agent ineligibility. It authenticates no human and makes no claim of
 truth, consent, custody, or reviewer identity.
 
+Optionally authenticate accepted artifact bytes with an external Ed25519 key:
+
+```sh
+mun sign transcript.accepted.json transcript.accepted.json.receipt.json --key producer.pem --role transcript-producer -o transcript.auth.json
+mun verify transcript.accepted.json transcript.accepted.json.receipt.json transcript.auth.json
+```
+
+Mun stores only public key material and a fingerprint in the envelope. This
+authenticates bytes and a producer-declared role, not accuracy, identity,
+consent, authorization, or custody.
+
 ### Understand deletion receipts
 
 Model removal prints a receipt with the exact managed path attempted, the app-visible result, and estimated bytes removed. Transient download cleanup uses the same scoped receipt contract. Receipts do not claim universal erasure. They explicitly exclude backups, APFS snapshots, swap, filesystem remnants, transcript exports, and third-party caches. Mun refuses deletion requests outside its managed model directory.
