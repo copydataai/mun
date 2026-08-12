@@ -25,10 +25,10 @@ class QualificationTests(unittest.TestCase):
     def manifest(self) -> dict:
         return json.loads((FIXTURES / "run-manifest.json").read_text(encoding="utf-8"))
 
-    def test_physical_run_records_exact_tuple_hashes_measurements_and_capabilities(self) -> None:
+    def test_manifest_records_exact_tuple_hashes_measurements_and_capabilities(self) -> None:
         record = create_qualification_record(self.manifest(), base_dir=FIXTURES)
 
-        self.assertEqual(record["status"], "tested")
+        self.assertEqual(record["status"], "eligible")
         self.assertTrue(record["unsigned"])
         self.assertEqual(record["tuple"]["device"]["effective"], "mps")
         self.assertEqual(record["tuple"]["device"]["precision"], "float16")
@@ -50,7 +50,16 @@ class QualificationTests(unittest.TestCase):
         record = create_qualification_record(manifest, base_dir=FIXTURES)
 
         self.assertEqual(record["status"], "eligible")
-        self.assertEqual(record["status_reason"], "no_physical_execution")
+        self.assertEqual(record["status_reason"], "observed_execution_unavailable")
+
+    def test_caller_asserted_physical_execution_cannot_produce_tested(self) -> None:
+        manifest = self.manifest()
+        manifest["physical_execution"] = True
+
+        record = create_qualification_record(manifest, base_dir=FIXTURES)
+
+        self.assertEqual(record["status"], "eligible")
+        self.assertEqual(record["status_reason"], "observed_execution_unavailable")
 
     def test_physical_failure_and_matrix_exclusion_have_distinct_statuses(self) -> None:
         failed = self.manifest()
@@ -92,7 +101,7 @@ class QualificationTests(unittest.TestCase):
 
         missing = missing_tested_claims([record], claims, now=datetime(2026, 8, 13, tzinfo=UTC))
 
-        self.assertEqual(missing, [claims[1]])
+        self.assertEqual(missing, claims)
         self.assertEqual(
             missing_tested_claims([record], claims[:1], now=datetime(2026, 11, 11, tzinfo=UTC)),
             claims[:1],
@@ -117,7 +126,7 @@ class QualificationTests(unittest.TestCase):
             record = json.loads(output_path.read_text(encoding="utf-8"))
 
         self.assertEqual(status, 0)
-        self.assertEqual(record["status"], "tested")
+        self.assertEqual(record["status"], "eligible")
         self.assertTrue(record["unsigned"])
         self.assertIn("unsigned local qualification record", stdout.getvalue())
 

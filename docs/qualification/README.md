@@ -1,8 +1,8 @@
 # Exact-tuple qualification records
 
-`mun qualify` converts a completed local-run manifest into one versioned,
-unsigned JSON record. It does not execute a model, sign evidence, approve a
-support claim, or publish anything.
+`mun qualify` converts a local-run manifest into one versioned, unsigned JSON
+record. It does not execute fixtures or a model, observe command results, sign
+evidence, approve a support claim, or publish anything.
 
 ```sh
 mun qualify path/to/run-manifest.json -o qualification.json
@@ -28,10 +28,12 @@ qualification evidence.
 
 ## Status and claim rules
 
-- `eligible`: metadata or compatibility evidence only. Setting
-  `physical_execution` to false can never produce `tested`.
-- `tested`: the exact physical tuple ran, the run passed, all advertised
-  capability rows are present and passed, and cold/warm measurements exist.
+- `eligible`: metadata or caller-supplied run information only. Manifest
+  conversion produces at most `eligible`; `physical_execution`, timing, and
+  outcome fields cannot elevate it to `tested`.
+- `tested`: unavailable until Mun has an execution path that invokes fixtures
+  itself and records observed command results, timings, tuple facts, and
+  artifact digests.
 - `failed`: physical execution or an advertised capability failed.
 - `unsupported`: the tuple is outside the supported matrix.
 
@@ -51,6 +53,7 @@ hardware policy.
 The output is deliberately marked `unsigned` and `local_record`. It is local
 evidence supplied by the operator, not an attestation. Review, signature,
 acceptance of regressions, release gating, and publication remain external.
-Qualification establishes runtime compatibility and observed execution only.
-It does not establish transcript accuracy, comparative model quality, model
-safety, or suitability for a language, domain, or person.
+Manifest conversion establishes runtime compatibility only. A future observed
+execution path may establish execution evidence, but neither form establishes
+transcript accuracy, comparative model quality, model safety, or suitability
+for a language, domain, or person.

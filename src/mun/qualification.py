@@ -33,13 +33,12 @@ def create_qualification_record(manifest: Mapping[str, Any], *, base_dir: Path) 
     if missing:
         raise QualificationError(f"missing capability outcomes: {', '.join(missing)}")
 
-    physical = manifest.get("physical_execution") is True
     run_outcome = manifest.get("run_outcome", "passed")
     if run_outcome not in {"passed", "failed", "unsupported"}:
         raise QualificationError("run_outcome must be passed, failed, or unsupported")
-    status, reason = _status(physical, run_outcome, capabilities, advertised)
+    status, reason = _status(run_outcome, capabilities, advertised)
 
-    timing = _timing_record(manifest.get("timing"), required=status == "tested")
+    timing = _timing_record(manifest.get("timing"), required=False)
     peak_memory = _peak_memory_record(manifest.get("peak_memory"))
     tuple_digest = _digest(exact_tuple)
     record = {
@@ -108,20 +107,17 @@ def missing_tested_claims(
 
 
 def _status(
-    physical: bool,
     run_outcome: str,
     capabilities: list[dict[str, Any]],
     advertised: list[str],
 ) -> tuple[str, str]:
     if run_outcome == "unsupported":
         return "unsupported", "outside_supported_matrix"
-    if not physical:
-        return "eligible", "no_physical_execution"
     if run_outcome == "failed" or any(row["outcome"] == "failed" for row in capabilities):
         return "failed", "physical_execution_failed"
     if any(row["outcome"] != "passed" for row in capabilities if row["name"] in advertised):
         return "failed", "advertised_capability_did_not_pass"
-    return "tested", "physical_execution_passed"
+    return "eligible", "observed_execution_unavailable"
 
 
 def _validate_tuple(exact_tuple: Mapping[str, Mapping[str, Any]]) -> None:
