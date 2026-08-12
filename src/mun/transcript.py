@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import platform
+import sys
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Literal
@@ -78,6 +80,50 @@ class ModelProvenance:
 class RuntimeProvenance:
     name: str
     version: str | None
+    environment: RuntimeEnvironment | None = None
+
+
+@dataclass(frozen=True)
+class RuntimeEnvironment:
+    python_version: str
+    python_implementation: str
+    operating_system: str
+    machine: str
+
+
+@dataclass(frozen=True)
+class ConverterIdentity:
+    name: str
+    version: str | None
+
+
+@dataclass(frozen=True)
+class PreparedMediaRecord:
+    used: bool
+    sha256: str | None
+    media_format: str | None
+    sample_rate_hz: int | None
+    channels: int | None
+    converter: ConverterIdentity | None
+
+
+@dataclass(frozen=True)
+class OperationParameters:
+    language: str | None
+    timestamps: bool
+    translate: bool
+    chunk_length: int
+    stride_length: int
+    requested_device: str
+    effective_device: str
+    precision: str | None
+
+
+@dataclass(frozen=True)
+class OperationRecord:
+    parameters: OperationParameters
+    prepared_media: PreparedMediaRecord
+    source_hash_policy: str
 
 
 @dataclass(frozen=True)
@@ -100,6 +146,7 @@ class TranscriptResult:
     speakers: list[Speaker]
     diagnostics: list[Diagnostic]
     provenance: Provenance
+    operation: OperationRecord | None = None
     overlap_ms: int = 0
 
     def to_dict(self) -> dict:
@@ -131,7 +178,16 @@ def make_provenance(*, mun_version: str, model_id: str, revision: str | None, ru
         mun_version=mun_version,
         created_at=datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         model=ModelProvenance(model_id, revision),
-        runtime=RuntimeProvenance(runtime_name, runtime_version),
+        runtime=RuntimeProvenance(
+            runtime_name,
+            runtime_version,
+            RuntimeEnvironment(
+                python_version=platform.python_version(),
+                python_implementation=platform.python_implementation(),
+                operating_system=sys.platform,
+                machine=platform.machine(),
+            ),
+        ),
         requested_device=requested_device,
         effective_device=effective_device,
         precision=precision,

@@ -20,6 +20,9 @@ from .transcript import (
     SCHEMA_VERSION,
     Diagnostic,
     Language,
+    OperationParameters,
+    OperationRecord,
+    PreparedMediaRecord,
     SourceRecord,
     TranscriptResult,
     TranscriptSegment,
@@ -37,6 +40,7 @@ MEDIA_EXTENSIONS = {
 }
 _FFPROBE_CACHE: dict[Path, tuple[bool, bool]] = {}
 _BINARY_PATH_CACHE: dict[str, str | None] = {}
+SOURCE_HASH_POLICY = "sha256_source_bytes"
 
 
 def _cached_binary_path(name: str, missing_error: str) -> str:
@@ -105,6 +109,41 @@ def _media_size_or_zero(media: SourceMedia) -> int:
         return media.source.stat().st_size
     except OSError:
         return 0
+
+
+def _sha256_file(path: Path) -> str | None:
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _source_record(media: SourceMedia, sha256: str | None = None) -> SourceRecord:
+    return SourceRecord(media.source.name, str(media.relative), sha256=sha256 if sha256 is not None else _sha256_file(media.source))
+
+
+def _operation(runtime: Any, options: TranscriptionOptions, source_sha256: str | None) -> OperationRecord:
+    prepared = getattr(runtime, "prepared_media", None)
+    if prepared is None:
+        prepared = PreparedMediaRecord(False, source_sha256, None, None, None, None)
+    return OperationRecord(
+        parameters=OperationParameters(
+            language=options.language,
+            timestamps=options.timestamps,
+            translate=options.translate,
+            chunk_length=options.chunk_length,
+            stride_length=options.stride_length,
+            requested_device=options.device,
+            effective_device=runtime.info.effective_device,
+            precision=runtime.info.precision,
+        ),
+        prepared_media=prepared,
+        source_hash_policy=SOURCE_HASH_POLICY,
+    )
 
 
 def _probe_media(path: Path) -> tuple[bool, bool]:
@@ -313,11 +352,12 @@ def run_batch(
             queued_results[index] = TranscriptResult(
                 schema_version=SCHEMA_VERSION,
                 status="partial",
-                source=SourceRecord(item.source.name, str(item.relative)),
+                source=_source_record(item),
                 transcripts=[],
                 speakers=[],
                 diagnostics=[Diagnostic("warning", "output_exists", "Output already exists", "output", True)],
                 provenance=_provenance(fallback_runtime, model, options),
+                operation=_operation(fallback_runtime, options, _sha256_file(item.source)),
             )
         for index in sorted(queued_results):
             summaries.append(queued_results[index])
@@ -352,11 +392,12 @@ def run_batch(
         queued_results[index] = TranscriptResult(
             schema_version=SCHEMA_VERSION,
             status="partial",
-            source=SourceRecord(item.source.name, str(item.relative)),
+            source=_source_record(item),
             transcripts=[],
             speakers=[],
             diagnostics=[Diagnostic("warning", "output_exists", "Output already exists", "output", True)],
             provenance=_provenance(fallback_runtime, model, options),
+            operation=_operation(fallback_runtime, options, _sha256_file(item.source)),
         )
 
     if jobs == 1:
@@ -374,11 +415,12 @@ def run_batch(
                 queued_results[index] = TranscriptResult(
                     schema_version=SCHEMA_VERSION,
                     status="failed",
-                    source=SourceRecord(item.source.name, str(item.relative)),
+                    source=_source_record(item),
                     transcripts=[],
                     speakers=[],
                     diagnostics=[Diagnostic("error", "transcription_failed", "Transcription failed", "transcription", False)],
                     provenance=_provenance(runtime, model, options),
+                    operation=_operation(runtime, options, _sha256_file(item.source)),
                 )
                 progress(f"[{index}/{len(media)}] failed {item.source}: {exc}")
 
@@ -409,11 +451,12 @@ def run_batch(
                 result = TranscriptResult(
                     schema_version=SCHEMA_VERSION,
                     status="failed",
-                    source=SourceRecord(item.source.name, str(item.relative)),
+                    source=_source_record(item),
                     transcripts=[],
                     speakers=[],
                     diagnostics=[Diagnostic("error", "transcription_failed", "Transcription failed", "transcription", False)],
                     provenance=_provenance(fallback_runtime, model, options),
+                    operation=_operation(fallback_runtime, options, _sha256_file(item.source)),
                 )
 
             completed[index] = result
@@ -437,6 +480,8 @@ def run_batch(
 
 
 def transcribe_source(runtime: Any, media: SourceMedia, model: InstalledModel, options: TranscriptionOptions) -> TranscriptResult:
+    source_sha256 = _sha256_file(media.source)
+    source = _source_record(media, source_sha256)
     try:
         original, translated = runtime.transcribe(media.source, options)
         transcripts = [_variant("original", original, options.language, options.language is not None)]
@@ -445,21 +490,23 @@ def transcribe_source(runtime: Any, media: SourceMedia, model: InstalledModel, o
         return TranscriptResult(
             schema_version=SCHEMA_VERSION,
             status="completed",
-            source=SourceRecord(media.source.name, str(media.relative)),
+            source=source,
             transcripts=transcripts,
             speakers=[],
             diagnostics=[],
             provenance=_provenance(runtime, model, options),
+            operation=_operation(runtime, options, source_sha256),
         )
     except Exception:
         return TranscriptResult(
             schema_version=SCHEMA_VERSION,
             status="failed",
-            source=SourceRecord(media.source.name, str(media.relative)),
+            source=source,
             transcripts=[],
             speakers=[],
             diagnostics=[Diagnostic("error", "transcription_failed", "Transcription failed", "transcription", False)],
             provenance=_provenance(runtime, model, options),
+            operation=_operation(runtime, options, source_sha256),
         )
 
 

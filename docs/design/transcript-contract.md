@@ -17,7 +17,7 @@ invented values.
     "name": "interview.wav",
     "relative_path": "sessions/interview.wav",
     "duration_ms": 92000,
-    "sha256": null
+    "sha256": "sha256-of-the-exact-source-bytes"
   },
   "transcripts": [
     {
@@ -66,10 +66,40 @@ invented values.
       "revision": "immutable-commit-sha",
       "artifact_sha256": null
     },
-    "runtime": {"name": "transformers", "version": "5.x"},
+    "runtime": {
+      "name": "transformers",
+      "version": "5.x",
+      "environment": {
+        "python_version": "3.11.14",
+        "python_implementation": "CPython",
+        "operating_system": "darwin",
+        "machine": "arm64"
+      }
+    },
     "requested_device": "auto",
     "effective_device": "mps",
     "precision": "float16"
+  },
+  "operation": {
+    "parameters": {
+      "language": "es",
+      "timestamps": true,
+      "translate": true,
+      "chunk_length": 30,
+      "stride_length": 5,
+      "requested_device": "auto",
+      "effective_device": "mps",
+      "precision": "float16"
+    },
+    "prepared_media": {
+      "used": true,
+      "sha256": "sha256-of-the-exact-wav-passed-to-the-runtime",
+      "media_format": "wav",
+      "sample_rate_hz": 16000,
+      "channels": 1,
+      "converter": {"name": "ffmpeg", "version": "ffmpeg version 8.0"}
+    },
+    "source_hash_policy": "sha256_source_bytes"
   }
 }
 ```
@@ -77,8 +107,23 @@ invented values.
 Required top-level fields are `schema_version`, `status`, `source`,
 `transcripts`, `speakers`, `diagnostics`, and `provenance`. Optional scalar
 values are `null`; optional collections are empty arrays. Absolute source paths
-are excluded by default. An explicit diagnostic mode may add one, and source
-hashing is opt-in because it reads the complete media file.
+are excluded by default. An explicit diagnostic mode may add one. Mun hashes the
+complete source bytes before transcription. The `sha256_source_bytes` policy
+means the digest identifies byte content independently of the source path.
+
+`operation.parameters` records every `TranscriptionOptions` value that can affect
+inference, together with the runtime's effective device and precision. The
+prepared-media record describes the exact audio input passed to the speech
+runtime. For a directly usable 16 kHz mono PCM WAV, `used` is `false`, its digest
+matches the runtime input, and `converter` is `null`. When Mun converts media,
+`used` is `true`, the digest covers the exact temporary WAV after FFmpeg exits,
+and the record includes WAV format, sample rate, channels, and the FFmpeg version.
+Temporary paths and names are never recorded.
+
+Runtime environment fields are limited to stable, non-secret replay facts:
+Python version and implementation, operating-system identifier, and machine
+architecture. They do not contain usernames, home directories, environment
+variables, hostnames, absolute paths, or secrets.
 
 ## Invariants
 
@@ -104,6 +149,8 @@ hashing is opt-in because it reads the complete media file.
 - Provenance identifies the exact model revision, derived artifact when used,
   runtime, requested and effective device, precision, Mun version, and creation
   time. Unavailable values remain `null`.
+- SHA-256 digests establish byte identity only. They do not establish
+  authenticity, consent, custody or continuity, or semantic correctness.
 
 Schema version 1 permits additive fields. Consumers must ignore unknown fields.
 Removing a field, changing its meaning or type, or tightening previously valid

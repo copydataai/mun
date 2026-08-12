@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import hashlib
+import subprocess
 import tempfile
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Protocol
 
-from .core import Segment, Transcript, TranscriptionOptions, _audio_input_path, _can_use_source_audio_directly
+from .core import Segment, Transcript, TranscriptionOptions, _audio_input_path, _cached_binary_path, _can_use_source_audio_directly
 from .errors import MunError
 from .models import InstalledModel
+from .transcript import ConverterIdentity, PreparedMediaRecord
 
 
 @dataclass(frozen=True)
@@ -57,6 +60,7 @@ class TransformersRuntime:
             raise MunError(f"Could not load {model.id}: {exc}") from exc
 
     def transcribe(self, source: Path, options: TranscriptionOptions) -> tuple[Transcript, Transcript | None]:
+        self.prepared_media = None
         model_type = self.info.model_type
         if options.timestamps and model_type not in {"whisper", "wav2vec2", "hubert", "wavlm"}:
             raise MunError(f"The selected {model_type} model cannot provide timestamps")
@@ -64,12 +68,14 @@ class TransformersRuntime:
             raise MunError("Language selection and English translation require a Whisper-family model")
         if _can_use_source_audio_directly(source):
             wav_path = source
+            self.prepared_media = _prepared_media_record(wav_path, used=False)
             original = self._run_pipeline(wav_path, options, task="transcribe")
             translated = self._run_pipeline(wav_path, options, task="translate") if options.translate else None
             return original, translated
 
         with tempfile.TemporaryDirectory(prefix="mun-") as temporary_directory:
             wav_path, _ = _audio_input_path(source, Path(temporary_directory) / "audio.wav")
+            self.prepared_media = _prepared_media_record(wav_path, used=True)
             original = self._run_pipeline(wav_path, options, task="transcribe")
             translated = self._run_pipeline(wav_path, options, task="translate") if options.translate else None
             return original, translated
@@ -97,6 +103,7 @@ class FakeSpeechRuntime:
         self._original = original
         self._translated = translated
         self.info = RuntimeInfo("test", "0", "test", "cpu", "test", "whisper")
+        self.prepared_media: PreparedMediaRecord | None = None
 
     def transcribe(self, source: Path, options: TranscriptionOptions) -> tuple[Transcript, Transcript | None]:
         return self._original, self._translated if options.translate else None
@@ -127,3 +134,36 @@ def _package_version(package: str) -> str | None:
         return version(package)
     except PackageNotFoundError:
         return None
+
+
+def _sha256_file(path: Path) -> str | None:
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def ffmpeg_version() -> str | None:
+    try:
+        ffmpeg = _cached_binary_path("ffmpeg", "FFmpeg is not installed. Install FFmpeg and try again.")
+        result = subprocess.run([ffmpeg, "-version"], capture_output=True, text=True, check=False)
+    except (MunError, OSError):
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    return result.stdout.splitlines()[0].strip()
+
+
+def _prepared_media_record(path: Path, *, used: bool) -> PreparedMediaRecord:
+    return PreparedMediaRecord(
+        used=used,
+        sha256=_sha256_file(path),
+        media_format="wav",
+        sample_rate_hz=16_000,
+        channels=1,
+        converter=ConverterIdentity("ffmpeg", ffmpeg_version()) if used else None,
+    )

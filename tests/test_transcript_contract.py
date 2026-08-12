@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import unittest
 import time
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -31,7 +33,11 @@ class TranscriptContractTests(unittest.TestCase):
         self.runtime = FakeSpeechRuntime(Transcript("Hello world", [Segment("Hello", 0.0, 1.25)], "en"))
 
     def test_workflow_returns_canonical_result(self) -> None:
-        result = run_transcription_workflow([self.media], self.model, TranscriptionOptions(), runtime=self.runtime)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source.wav"
+            source.write_bytes(b"canonical source bytes")
+            media = SourceMedia(source, Path("batch/source.wav"))
+            result = run_transcription_workflow([media], self.model, TranscriptionOptions(), runtime=self.runtime)[0]
         payload = result.to_dict()
 
         self.assertEqual(payload["schema_version"], 1)
@@ -40,8 +46,46 @@ class TranscriptContractTests(unittest.TestCase):
         self.assertNotIn("/private", json.dumps(payload))
         self.assertEqual(payload["transcripts"][0]["segments"][0]["start_ms"], 0)
         self.assertEqual(payload["provenance"]["runtime"]["name"], "test")
-        self.assertIsNone(payload["source"]["sha256"])
+        self.assertEqual(payload["source"]["sha256"], hashlib.sha256(b"canonical source bytes").hexdigest())
         self.assertIn("precision", payload["provenance"])
+
+    def test_source_digest_depends_on_bytes_not_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            first = Path(temporary) / "first.wav"
+            second = Path(temporary) / "renamed.wav"
+            first.write_bytes(b"same bytes")
+            second.write_bytes(b"same bytes")
+            results = run_transcription_workflow(
+                [SourceMedia(first, Path("first.wav")), SourceMedia(second, Path("renamed.wav"))],
+                self.model,
+                TranscriptionOptions(),
+                runtime=self.runtime,
+            )
+
+        self.assertEqual(results[0].source.sha256, results[1].source.sha256)
+
+    def test_operation_records_every_inference_affecting_option(self) -> None:
+        options = TranscriptionOptions(
+            language="es", timestamps=True, translate=True, chunk_length=42, stride_length=7, device="mps"
+        )
+        result = run_transcription_workflow([self.media], self.model, options, runtime=self.runtime)[0]
+        payload = result.to_dict()
+
+        self.assertEqual(
+            payload["operation"]["parameters"],
+            {
+                "language": "es",
+                "timestamps": True,
+                "translate": True,
+                "chunk_length": 42,
+                "stride_length": 7,
+                "requested_device": "mps",
+                "effective_device": "cpu",
+                "precision": "test",
+            },
+        )
+        self.assertEqual(payload["operation"]["source_hash_policy"], "sha256_source_bytes")
+        self.assertIn("environment", payload["provenance"]["runtime"])
 
     def test_json_txt_srt_vtt_are_deterministic_projections(self) -> None:
         result = run_transcription_workflow([self.media], self.model, TranscriptionOptions(), runtime=self.runtime)[0]
@@ -98,6 +142,8 @@ class TranscriptContractTests(unittest.TestCase):
 
         payload = json.dumps(result.to_dict())
         self.assertEqual(result.status, "failed")
+        self.assertIn('"operation"', payload)
+        self.assertIn('"parameters"', payload)
         self.assertNotIn("secret", payload)
         self.assertNotIn("/Users/private", payload)
 
