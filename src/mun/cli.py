@@ -18,7 +18,7 @@ from .acceptance import create_acceptance
 from .artifacts import canonical_json_bytes
 from .authentication import sign_artifact, verify_artifact
 from .journal import resume_batch_journal
-from .quality import DeterministicFixtureRuntime, run_quality_qualification
+from .quality import DeterministicFixtureRuntime, PublicTranscriptionAdapter, run_quality_qualification
 from .config import config_path, load_config, reset_config, set_config
 from .core import (
     TranscriptionOptions,
@@ -160,6 +160,9 @@ def build_parser() -> argparse.ArgumentParser:
     quality.add_argument("manifest", type=Path)
     quality.add_argument("-o", "--output", type=Path, required=True)
     quality.add_argument("--deterministic-fake-runtime", action="store_true", help="test the evidence workflow without claiming physical qualification")
+    quality.add_argument("--real-runtime", action="store_true", help="execute fixtures through the installed public transcription workflow")
+    quality.add_argument("--model-dir", help="managed model directory for --real-runtime")
+    quality.add_argument("--device", default="auto", help="requested device for --real-runtime")
 
     doctor = subcommands.add_parser("doctor", help="diagnose the local runtime")
     doctor.add_argument("--json", action="store_true")
@@ -206,10 +209,18 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(resume_batch_journal(args.journal), sort_keys=True))
             return 0
         if args.command == "qualify-run":
-            if not args.deterministic_fake_runtime:
-                raise MunError("A real public runtime adapter is required; use --deterministic-fake-runtime only for workflow tests")
+            if args.deterministic_fake_runtime == args.real_runtime:
+                raise MunError("Select exactly one of --real-runtime or --deterministic-fake-runtime")
             manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
-            record = run_quality_qualification(manifest, base_dir=args.manifest.parent, runtime=DeterministicFixtureRuntime())
+            if args.real_runtime:
+                tuple_model = manifest.get("tuple", {}).get("model", {})
+                model_id = tuple_model.get("repository") if isinstance(tuple_model, dict) else None
+                model = find_installed(models_root(load_config(), args.model_dir), model_id)
+                public_runtime = load_pipeline(model, args.device)[0]
+                quality_runtime = PublicTranscriptionAdapter(model, public_runtime, requested_device=args.device)
+            else:
+                quality_runtime = DeterministicFixtureRuntime()
+            record = run_quality_qualification(manifest, base_dir=args.manifest.parent, runtime=quality_runtime)
             if args.output.exists():
                 raise MunError("Refusing to overwrite a quality qualification record")
             args.output.write_bytes(canonical_json_bytes(record) + b"\n")
