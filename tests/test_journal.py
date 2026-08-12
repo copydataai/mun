@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 from unittest.mock import patch
@@ -52,6 +53,34 @@ class JournalTests(unittest.TestCase):
             self.assertEqual(txt_path.read_text(encoding="utf-8"), "Recovered\n")
             self.assertEqual(first, second)
             self.assertEqual(first["sources"][0]["classification"], "verified-complete")
+
+    def test_partial_commit_resume_verifies_json_from_journal_payload_despite_restored_runtime_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            journal_path, runtime = self._partial_commit(root)
+            json_path = root / "out" / "source.json"
+            committed = json_path.read_bytes()
+
+            from mun import core
+
+            write_outputs = core.write_result_outputs
+
+            def write_after_time_and_identity_drift(*args, **kwargs):
+                result = args[2]
+                provenance = replace(
+                    result.provenance,
+                    created_at="2099-12-31T23:59:59Z",
+                    mun_version="different-process-version",
+                )
+                drifted = replace(result, provenance=provenance)
+                return write_outputs(*args[:2], drifted, *args[3:], **kwargs)
+
+            with patch("mun.core.write_result_outputs", side_effect=write_after_time_and_identity_drift):
+                resumed = resume_batch_journal(journal_path, runtime_loader=lambda _model, _device: runtime)
+
+            self.assertEqual(json_path.read_bytes(), committed)
+            self.assertEqual((root / "out" / "source.txt").read_text(encoding="utf-8"), "Recovered\n")
+            self.assertEqual(resumed["sources"][0]["classification"], "verified-complete")
 
     def test_partial_commit_resume_rejects_conflicting_committed_projection_without_writing_remainder(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -181,8 +181,10 @@ def resume_batch_journal(
                 "inference_completed",
                 evidence={"result": result.to_dict(), "result_digest": result.result_digest},
             )
+            canonical_result = result
         else:
-            result = TranscriptResult.from_json(json.dumps(result_payload))
+            canonical_result = TranscriptResult.from_json(json.dumps(result_payload))
+            result = canonical_result
 
         if result.status != "completed":
             journal.transition(row["source_sha256"], "failed", evidence={"result": result.to_dict()})
@@ -223,6 +225,7 @@ def resume_batch_journal(
                 overwrite=bool(binding.get("overwrite")),
                 transition=transition,
                 resume_artifacts=resumable,
+                canonical_result=canonical_result,
             )
         except MunError as exc:
             raise JournalError("Resumed projections conflict with the journal-bound result") from exc

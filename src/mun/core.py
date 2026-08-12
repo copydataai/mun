@@ -1059,6 +1059,7 @@ def write_result_outputs(
     overwrite: bool,
     transition: Callable[[str, dict[str, Any]], None] | None = None,
     resume_artifacts: Mapping[str, str] | None = None,
+    canonical_result: TranscriptResult | None = None,
 ) -> list[Path]:
     projections: list[tuple[Path, str, TranscriptResult]] = []
     for format_name in formats:
@@ -1105,13 +1106,16 @@ def write_result_outputs(
     staged: list[tuple[Path, Path]] = []
     try:
         for index, (destination, format_name, single) in enumerate(projections):
-            content = render_output(
-                format_name,
-                single,
-                SourceMedia(Path(result.source.name), Path(result.source.relative_path)),
-                InstalledModel(result.provenance.model.repository, result.provenance.model.revision or "", "", ""),
-                result.provenance.effective_device,
-            )
+            if format_name == "json" and canonical_result is not None:
+                content = canonical_result.to_json()
+            else:
+                content = render_output(
+                    format_name,
+                    single,
+                    SourceMedia(Path(result.source.name), Path(result.source.relative_path)),
+                    InstalledModel(result.provenance.model.repository, result.provenance.model.revision or "", "", ""),
+                    result.provenance.effective_device,
+                )
             staged_path = staging / f"{index:04d}-{destination.name}"
             staged_path.write_text(content, encoding="utf-8")
             digest = _sha256_file(staged_path)
