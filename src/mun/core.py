@@ -32,6 +32,7 @@ from .transcript import (
     TranscriptSegment,
     TranscriptVariant,
     make_provenance,
+    make_trust,
     render_json,
     render_srt,
     render_txt,
@@ -242,6 +243,7 @@ def _blocked_result(
         provenance=_provenance(runtime, model, options),
         operation=_operation(runtime, options, source_sha256),
         reuse_status=reuse_status,
+        trust=make_trust(model.trust_remote_code),
     )
 
 
@@ -518,6 +520,7 @@ def run_batch(
                     provenance=_provenance(runtime, model, options),
                     operation=_operation(runtime, options, _sha256_file(item.source)),
                     reuse_status=queued_status[index],
+                    trust=make_trust(model.trust_remote_code),
                 )
                 progress(f"[{index}/{len(media)}] partial {item.source} (export commit incomplete)")
             except Exception as exc:
@@ -531,6 +534,7 @@ def run_batch(
                     provenance=_provenance(runtime, model, options),
                     operation=_operation(runtime, options, _sha256_file(item.source)),
                     reuse_status=queued_status[index],
+                    trust=make_trust(model.trust_remote_code),
                 )
                 progress(f"[{index}/{len(media)}] failed {item.source}: {exc}")
 
@@ -569,6 +573,7 @@ def run_batch(
                     provenance=_provenance(fallback_runtime, model, options),
                     operation=_operation(fallback_runtime, options, _sha256_file(item.source)),
                     reuse_status=queued_status[index],
+                    trust=make_trust(model.trust_remote_code),
                 )
 
             completed[index] = result
@@ -616,6 +621,7 @@ def transcribe_source(runtime: Any, media: SourceMedia, model: InstalledModel, o
             diagnostics=[],
             provenance=_provenance(runtime, model, options),
             operation=_operation(runtime, options, source_sha256),
+            trust=make_trust(model.trust_remote_code),
         )
     except Exception:
         return TranscriptResult(
@@ -627,6 +633,7 @@ def transcribe_source(runtime: Any, media: SourceMedia, model: InstalledModel, o
             diagnostics=[Diagnostic("error", "transcription_failed", "Transcription failed", "transcription", False)],
             provenance=_provenance(runtime, model, options),
             operation=_operation(runtime, options, source_sha256),
+            trust=make_trust(model.trust_remote_code),
         )
 
 

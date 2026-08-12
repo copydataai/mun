@@ -11,7 +11,7 @@ from typing import Any, Protocol
 from .core import Segment, Transcript, TranscriptionOptions, _audio_input_path, _cached_binary_path, _can_use_source_audio_directly
 from .errors import MunError
 from .models import InstalledModel, verify_installed_model
-from .transcript import ConverterIdentity, PreparedMediaRecord
+from .transcript import ConverterIdentity, ModelTrust, PreparedMediaRecord
 
 
 @dataclass(frozen=True)
@@ -22,6 +22,7 @@ class RuntimeInfo:
     effective_device: str
     precision: str | None
     model_type: str
+    model_trust: ModelTrust = "verified_artifact"
 
 
 class SpeechRuntime(Protocol):
@@ -32,6 +33,8 @@ class SpeechRuntime(Protocol):
 
 class TransformersRuntime:
     def __init__(self, model: InstalledModel, requested_device: str = "auto") -> None:
+        if model.trust_remote_code and not model.remote_code_acknowledged:
+            raise MunError("Remote repository code has not been explicitly acknowledged for this pinned revision")
         verification = verify_installed_model(model)
         if verification.status not in {"verified", "unsafe_remote_code"}:
             detail = f" ({', '.join(verification.paths)})" if verification.paths else ""
@@ -62,6 +65,7 @@ class TransformersRuntime:
                 effective_device=device,
                 precision="float16" if dtype is torch.float16 else "float32",
                 model_type=config.model_type,
+                model_trust="unsafe_remote_code" if model.trust_remote_code else "verified_artifact",
             )
         except Exception as exc:
             raise MunError(f"Could not load {model.id}: {exc}") from exc

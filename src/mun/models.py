@@ -23,6 +23,15 @@ VerificationStatus = Literal[
     "unsafe_remote_code",
     "manifest_missing",
 ]
+DeletionResult = Literal["deleted", "not_found"]
+DELETION_EXCLUSIONS = (
+    "backups",
+    "APFS snapshots",
+    "swap",
+    "filesystem remnants",
+    "exports",
+    "third-party caches",
+)
 
 
 @dataclass(frozen=True)
@@ -33,6 +42,7 @@ class InstalledModel:
     installed_at: str
     status: str = "installed"
     trust_remote_code: bool = False
+    remote_code_acknowledged: bool = False
 
 
 @dataclass(frozen=True)
@@ -41,6 +51,22 @@ class VerificationResult:
     artifact_digest: str | None = None
     paths: tuple[str, ...] = ()
     guidance: str = ""
+
+
+@dataclass(frozen=True)
+class DeletionReceipt:
+    operation: Literal["model", "transient"]
+    attempted_paths: tuple[str, ...]
+    result: DeletionResult
+    estimated_bytes: int
+    exclusions: tuple[str, ...] = DELETION_EXCLUSIONS
+    removed_model: InstalledModel | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["attempted_paths"] = list(self.attempted_paths)
+        payload["exclusions"] = list(self.exclusions)
+        return payload
 
 
 def load_catalog() -> dict[str, Any]:
@@ -130,7 +156,10 @@ def download_model(
     revision: str | None,
     trust_remote_code: bool,
     offline: bool,
+    remote_code_acknowledged: bool = False,
 ) -> InstalledModel:
+    if trust_remote_code and not remote_code_acknowledged:
+        raise MunError("Remote repository code requires explicit acknowledgement for this pinned revision")
     if offline:
         raise MunError("Cannot download models in offline mode")
     try:
@@ -147,12 +176,16 @@ def download_model(
         existing = [model for model in installed_models(root) if model.id == model_id and model.revision == sha]
         if existing and existing[-1].status in {"installed", "ready"}:
             verification = verify_installed_model(existing[-1])
-            if verification.status in {"verified", "unsafe_remote_code"}:
+            if (
+                verification.status in {"verified", "unsafe_remote_code"}
+                and existing[-1].trust_remote_code == trust_remote_code
+                and existing[-1].remote_code_acknowledged == remote_code_acknowledged
+            ):
                 return existing[-1]
         directory = root / f"{_slug(model_id)}--{sha[:12]}"
         temporary_directory = root / f".{directory.name}.download"
         if temporary_directory.exists():
-            shutil.rmtree(temporary_directory)
+            remove_transient_with_receipt(root, temporary_directory)
         temporary_directory.mkdir(parents=True, exist_ok=False)
         model = InstalledModel(
             id=model_id,
@@ -161,6 +194,7 @@ def download_model(
             installed_at=datetime.now(UTC).isoformat(),
             status="downloading",
             trust_remote_code=trust_remote_code,
+            remote_code_acknowledged=remote_code_acknowledged,
         )
         needed_bytes, ignore_patterns = _download_plan(info.siblings or [])
         free_bytes = shutil.disk_usage(root).free
@@ -186,15 +220,22 @@ def download_model(
         return model
     except MunError:
         if "temporary_directory" in locals():
-            shutil.rmtree(temporary_directory, ignore_errors=True)
+            _discard_transient(root, temporary_directory)
         raise
     except Exception as exc:
         if "temporary_directory" in locals():
-            shutil.rmtree(temporary_directory, ignore_errors=True)
+            _discard_transient(root, temporary_directory)
         raise MunError(f"Model download failed: {exc}") from exc
 
 
 def remove_model(root: Path, target: str) -> tuple[InstalledModel, int]:
+    receipt = remove_model_with_receipt(root, target)
+    if receipt.removed_model is None:
+        raise MunError(f"No managed model matches: {target}")
+    return receipt.removed_model, receipt.estimated_bytes
+
+
+def remove_model_with_receipt(root: Path, target: str) -> DeletionReceipt:
     matches = [
         model
         for model in installed_models(root)
@@ -212,7 +253,26 @@ def remove_model(root: Path, target: str) -> tuple[InstalledModel, int]:
         raise MunError("Refusing to remove a directory not managed by Mun")
     size = sum(file.stat().st_size for file in path.rglob("*") if file.is_file())
     shutil.rmtree(path)
-    return model, size
+    return DeletionReceipt("model", (str(path),), "deleted", size, removed_model=model)
+
+
+def remove_transient_with_receipt(root: Path, target: Path) -> DeletionReceipt:
+    root = root.resolve()
+    path = target.resolve()
+    if path.parent != root or not path.name.startswith(".") or not path.name.endswith(".download"):
+        raise MunError("Refusing to remove a transient path outside Mun's managed model directory")
+    if not path.exists():
+        return DeletionReceipt("transient", (str(path),), "not_found", 0)
+    size = sum(file.stat().st_size for file in path.rglob("*") if file.is_file())
+    shutil.rmtree(path)
+    return DeletionReceipt("transient", (str(path),), "deleted", size)
+
+
+def _discard_transient(root: Path, target: Path) -> DeletionReceipt:
+    try:
+        return remove_transient_with_receipt(root, target)
+    except OSError:
+        return DeletionReceipt("transient", (str(target.resolve()),), "not_found", 0)
 
 
 def model_details(root: Path, target: str) -> dict[str, Any]:
@@ -254,6 +314,7 @@ def verify_installed_model(model: InstalledModel) -> VerificationResult:
             or manifest.get("source_revision") != model.revision
             or manifest.get("installed_at") != model.installed_at
             or manifest.get("trust_remote_code") != model.trust_remote_code
+            or manifest.get("remote_code_acknowledged", False) != model.remote_code_acknowledged
             or manifest.get("artifact_digest") != expected_digest
             or not isinstance(files, list)
         ):
@@ -323,6 +384,7 @@ def _write_manifest(directory: Path, model: InstalledModel) -> dict[str, Any]:
         "source_revision": model.revision,
         "installed_at": model.installed_at,
         "trust_remote_code": model.trust_remote_code,
+        "remote_code_acknowledged": model.remote_code_acknowledged,
         "files": records,
     }
     manifest = {**payload, "artifact_digest": _manifest_digest(payload)}

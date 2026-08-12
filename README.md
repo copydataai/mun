@@ -18,6 +18,8 @@ Mun is intentionally small: a command-line tool, a local model, and files you ca
 - **Made for real folders.** Pass files and directories together; Mun discovers readable media recursively, preserves its structure, and continues past transcription failures.
 - **Safe and inspectable.** Models are pinned to immutable revisions, existing transcripts are not overwritten by default, and JSON results record model and runtime provenance.
 
+Canonical JSON also records typed trust. Source media is `untrusted_bytes`, verified model snapshots are `verified_artifact`, remote-code snapshots are `unsafe_remote_code`, and machine text is `untrusted_model_output`. Every transcript result is `ineligible` for autonomous agent use. Human correction changes the content label to `untrusted_content` and adds review metadata. It does not remove the taint.
+
 ## Quick start
 
 ### 1. Install Mun from a checkout
@@ -61,6 +63,14 @@ Or use the scriptable workflow:
 mun models download openai/whisper-small
 mun transcribe interview.m4a
 ```
+
+Models requiring repository Python code need an immutable snapshot plus an explicit, revision-specific acknowledgement:
+
+```sh
+mun models download owner/model --trust-remote-code --acknowledge-remote-code
+```
+
+For automation, `remote_code_acknowledgement` may be configured only as the exact `owner/model@immutable-revision` value. These installations remain unsafe and untested, and their transcript results remain tainted and agent-ineligible.
 
 Transcripts are written to `./transcripts/`. Existing outputs are reused only when the complete requested projection set includes canonical JSON whose digest, source identity, operation parameters, model identity, and derived projections all validate. Unrelated files, invalid artifacts, and incomplete output sets block that source with a recoverable nonzero result. Pass `--overwrite` to replace only the output paths explicitly requested by the current command.
 
@@ -146,6 +156,10 @@ original-text mismatches fail closed. The canonical machine JSON is never
 rewritten. Corrected TXT, SRT, and VTT retain the machine segment timings, while
 corrected JSON records `reviewed` or `unreviewed`, the parent and correction-set
 identities, and a distinct export digest.
+
+### Understand deletion receipts
+
+Model removal prints a receipt with the exact managed path attempted, the app-visible result, and estimated bytes removed. Transient download cleanup uses the same scoped receipt contract. Receipts do not claim universal erasure. They explicitly exclude backups, APFS snapshots, swap, filesystem remnants, transcript exports, and third-party caches. Mun refuses deletion requests outside its managed model directory.
 
 ### Verify a transcript with bounded replay
 

@@ -35,7 +35,7 @@ from .models import (
     model_details,
     models_root,
     remote_model_summary,
-    remove_model,
+    remove_model_with_receipt,
     search_models,
 )
 
@@ -82,6 +82,11 @@ def build_parser() -> argparse.ArgumentParser:
     download.add_argument("model_id")
     download.add_argument("--revision")
     download.add_argument("--trust-remote-code", action="store_true")
+    download.add_argument(
+        "--acknowledge-remote-code",
+        action="store_true",
+        help="acknowledge execution of code from this model's pinned repository snapshot",
+    )
     download.add_argument("--yes", action="store_true")
     download.add_argument("--offline", action="store_true")
     list_parser = model_subcommands.add_parser("list", help="list installed models")
@@ -361,12 +366,29 @@ def command_models(args: argparse.Namespace) -> int:
             raise MunError("Cannot download models in offline mode")
         summary = remote_model_summary(args.model_id, args.revision)
         _print_mapping(summary)
+        acknowledgement = f"{args.model_id}@{summary['revision']}"
+        remote_code_acknowledged = args.acknowledge_remote_code or config.get("remote_code_acknowledgement") == acknowledgement
         if args.trust_remote_code:
-            print("WARNING: this model may execute Python code from its repository.", file=sys.stderr)
+            print(
+                "WARNING: this pinned snapshot may execute repository Python code. It remains unsafe, untested, and ineligible for agent use.",
+                file=sys.stderr,
+            )
+            if not remote_code_acknowledged:
+                raise MunError(
+                    "Remote repository code requires --acknowledge-remote-code or an exact "
+                    f"remote_code_acknowledgement={acknowledgement} configuration value"
+                )
         if not args.yes and not _confirm("Download this immutable model snapshot?"):
             print("Cancelled.")
             return 0
-        model = download_model(args.model_id, root, args.revision, args.trust_remote_code, False)
+        model = download_model(
+            args.model_id,
+            root,
+            args.revision,
+            args.trust_remote_code,
+            False,
+            remote_code_acknowledged=remote_code_acknowledged,
+        )
         print(f"Installed {model.id}@{model.revision} in {_redact_home(model.path)}")
         return 0
     if args.models_command == "info":
@@ -384,8 +406,8 @@ def command_models(args: argparse.Namespace) -> int:
         if not args.yes and not _confirm(f"Remove {model.id}@{model.revision[:12]}?"):
             print("Cancelled.")
             return 0
-        removed, reclaimed = remove_model(root, model.path)
-        print(f"Removed {removed.id}; reclaimed {_human_bytes(reclaimed)}")
+        receipt = remove_model_with_receipt(root, model.path)
+        print(json.dumps(receipt.to_dict(), indent=2))
         return 0
     raise MunError("Unknown models command")
 

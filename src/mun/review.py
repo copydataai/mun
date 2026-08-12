@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 from .artifacts import canonical_json_bytes
 from .errors import MunError
-from .transcript import TranscriptKind, TranscriptResult, render_json, render_srt, render_txt, render_vtt
+from .transcript import ReviewMetadata, TranscriptKind, TranscriptResult, TrustRecord, render_json, render_srt, render_txt, render_vtt
 
 ReviewState = Literal["reviewed", "unreviewed"]
 ReviewView = Literal["machine", "corrected"]
@@ -162,6 +162,16 @@ def apply_corrections(machine: TranscriptResult, correction_set: CorrectionSet) 
     for variant in payload["transcripts"]:
         if variant["segments"]:
             variant["text"] = " ".join(segment["text"] for segment in variant["segments"])
+    payload["trust"] = asdict(TrustRecord(
+        media="untrusted_bytes",
+        model=machine.trust.model,
+        content="untrusted_content",
+        review=ReviewMetadata(
+            state=correction_set.review_state,
+            correction_set_id=correction_set.correction_set_id,
+            correction_set_digest=correction_set.digest,
+        ),
+    ))
 
     corrected = TranscriptResult.from_json(json.dumps(payload))
     return CorrectedTranscript(

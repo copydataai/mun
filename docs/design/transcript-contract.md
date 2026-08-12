@@ -106,7 +106,8 @@ invented values.
 ```
 
 Required top-level fields are `schema_version`, `status`, `source`,
-`transcripts`, `speakers`, `diagnostics`, and `provenance`. Optional scalar
+`transcripts`, `speakers`, `diagnostics`, `provenance`, `trust`, and
+`agent_eligibility`. Optional scalar
 values are `null`; optional collections are empty arrays. Absolute source paths
 are excluded by default. An explicit diagnostic mode may add one. Mun hashes the
 complete source bytes before transcription. The `sha256_source_bytes` policy
@@ -125,6 +126,17 @@ Runtime environment fields are limited to stable, non-secret replay facts:
 Python version and implementation, operating-system identifier, and machine
 architecture. They do not contain usernames, home directories, environment
 variables, hostnames, absolute paths, or secrets.
+
+## Typed trust and agent eligibility
+
+Trust is additive provenance, not a safety claim. Every canonical result records:
+
+- media as `untrusted_bytes`;
+- model as `verified_artifact` or `unsafe_remote_code`;
+- machine content as `untrusted_model_output`; and
+- agent eligibility as `ineligible` with a human-judgment reason.
+
+Artifact verification means local bytes match the pinned manifest. It does not make model behavior or transcript text trusted. A corrected transcript remains `untrusted_content`, remains agent-ineligible, and adds review state, correction-set ID, and correction-set digest. Loaders accept legacy schema-version-1 results by assigning the conservative defaults. No transition can remove media or content taint, including results produced by unsafe remote code.
 
 ## Machine result identity
 

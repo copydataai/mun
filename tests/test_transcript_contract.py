@@ -50,6 +50,23 @@ class TranscriptContractTests(unittest.TestCase):
         self.assertEqual(payload["source"]["sha256"], hashlib.sha256(b"canonical source bytes").hexdigest())
         self.assertIn("precision", payload["provenance"])
         self.assertRegex(payload["result_digest"], r"^[0-9a-f]{64}$")
+        self.assertEqual(payload["trust"]["media"], "untrusted_bytes")
+        self.assertEqual(payload["trust"]["model"], "verified_artifact")
+        self.assertEqual(payload["trust"]["content"], "untrusted_model_output")
+        self.assertEqual(payload["agent_eligibility"]["status"], "ineligible")
+
+    def test_corrected_result_remains_tainted_with_review_metadata(self) -> None:
+        from tests.test_review import correction_payload, machine_result
+        from mun.review import CorrectionSet, apply_corrections
+
+        machine = machine_result()
+        corrections = CorrectionSet.from_json(json.dumps(correction_payload(machine)))
+        corrected = apply_corrections(machine, corrections).transcript.to_dict()
+
+        self.assertEqual(corrected["trust"]["content"], "untrusted_content")
+        self.assertEqual(corrected["trust"]["review"]["state"], corrections.review_state)
+        self.assertEqual(corrected["trust"]["review"]["correction_set_id"], corrections.correction_set_id)
+        self.assertEqual(corrected["agent_eligibility"]["status"], "ineligible")
 
     def test_json_loader_validates_claimed_result_digest(self) -> None:
         result = run_transcription_workflow([self.media], self.model, TranscriptionOptions(), runtime=self.runtime)[0]

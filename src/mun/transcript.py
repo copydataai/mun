@@ -15,6 +15,10 @@ ExportReceiptState = Literal["completed", "cancelled", "failed_before_commit", "
 ReuseStatus = Literal["reused_verified", "conflict", "incomplete_output_set", "overwrite_required", "queued"]
 TranscriptKind = Literal["original", "english_translation"]
 LanguageSource = Literal["detected", "forced", "model", "unknown"]
+MediaTrust = Literal["untrusted_bytes"]
+ModelTrust = Literal["verified_artifact", "unsafe_remote_code"]
+ContentTrust = Literal["untrusted_model_output", "untrusted_content"]
+AgentEligibilityStatus = Literal["ineligible"]
 
 
 @dataclass(frozen=True)
@@ -152,6 +156,27 @@ class OperationRecord:
 
 
 @dataclass(frozen=True)
+class ReviewMetadata:
+    state: Literal["reviewed", "unreviewed"]
+    correction_set_id: str
+    correction_set_digest: str
+
+
+@dataclass(frozen=True)
+class TrustRecord:
+    media: MediaTrust = "untrusted_bytes"
+    model: ModelTrust = "verified_artifact"
+    content: ContentTrust = "untrusted_model_output"
+    review: ReviewMetadata | None = None
+
+
+@dataclass(frozen=True)
+class AgentEligibility:
+    status: AgentEligibilityStatus = "ineligible"
+    reason: str = "Transcript content requires human judgment before agent use."
+
+
+@dataclass(frozen=True)
 class Provenance:
     mun_version: str
     created_at: str
@@ -175,8 +200,16 @@ class TranscriptResult:
     overlap_ms: int = 0
     result_digest: str | None = None
     reuse_status: ReuseStatus = "queued"
+    trust: TrustRecord = TrustRecord()
+    agent_eligibility: AgentEligibility = AgentEligibility()
 
     def __post_init__(self) -> None:
+        if self.trust.media != "untrusted_bytes" or self.trust.content not in {
+            "untrusted_model_output", "untrusted_content"
+        }:
+            raise ValueError("Transcript trust cannot remove source or content taint")
+        if self.agent_eligibility.status != "ineligible":
+            raise ValueError("Transcript results are not eligible for autonomous agent use")
         if self.result_digest is None:
             object.__setattr__(self, "result_digest", machine_result_digest(self.to_dict()))
 
@@ -247,6 +280,10 @@ def make_provenance(*, mun_version: str, model_id: str, revision: str | None, ar
     )
 
 
+def make_trust(trust_remote_code: bool = False) -> TrustRecord:
+    return TrustRecord(model="unsafe_remote_code" if trust_remote_code else "verified_artifact")
+
+
 def _transcript_result_from_dict(payload: dict[str, Any]) -> TranscriptResult:
     source = payload["source"]
     provenance = payload["provenance"]
@@ -254,6 +291,9 @@ def _transcript_result_from_dict(payload: dict[str, Any]) -> TranscriptResult:
     runtime = provenance["runtime"]
     environment = runtime.get("environment")
     operation = payload.get("operation")
+    trust = payload.get("trust") or {}
+    review = trust.get("review")
+    eligibility = payload.get("agent_eligibility") or {}
     return TranscriptResult(
         schema_version=payload["schema_version"],
         status=payload["status"],
@@ -279,6 +319,16 @@ def _transcript_result_from_dict(payload: dict[str, Any]) -> TranscriptResult:
         operation=_operation_from_dict(operation) if operation is not None else None,
         overlap_ms=payload.get("overlap_ms", 0),
         result_digest=payload.get("result_digest"),
+        trust=TrustRecord(
+            media=trust.get("media", "untrusted_bytes"),
+            model=trust.get("model", "verified_artifact"),
+            content=trust.get("content", "untrusted_model_output"),
+            review=ReviewMetadata(**review) if review is not None else None,
+        ),
+        agent_eligibility=AgentEligibility(
+            status=eligibility.get("status", "ineligible"),
+            reason=eligibility.get("reason", "Transcript content requires human judgment before agent use."),
+        ),
     )
 
 

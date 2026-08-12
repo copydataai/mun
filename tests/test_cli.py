@@ -31,6 +31,14 @@ class CliTests(unittest.TestCase):
         self.assertEqual(render_args.view, "corrected")
         self.assertEqual(render_args.format, "srt")
 
+    def test_remote_code_download_parses_explicit_acknowledgement(self) -> None:
+        args = build_parser().parse_args([
+            "models", "download", "owner/model", "--trust-remote-code", "--acknowledge-remote-code"
+        ])
+
+        self.assertTrue(args.trust_remote_code)
+        self.assertTrue(args.acknowledge_remote_code)
+
     def test_review_apply_and_render_do_not_rewrite_machine_json(self) -> None:
         from tests.test_review import correction_payload, machine_result
 

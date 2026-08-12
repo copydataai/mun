@@ -20,6 +20,7 @@ from mun.models import (
     search_models,
     verify_installed_model,
 )
+from mun.errors import MunError
 from mun.runtime import TransformersRuntime
 
 
@@ -120,6 +121,12 @@ class ModelTests(unittest.TestCase):
 
             self.assertEqual(verify_installed_model(model).status, "unsafe_remote_code")
 
+    def test_remote_code_download_requires_explicit_acknowledgement(self) -> None:
+        from mun.models import download_model
+
+        with self.assertRaisesRegex(MunError, "acknowledge"):
+            download_model("owner/model", Path("/models"), "abc", True, False)
+
     def test_transformers_runtime_verifies_before_importing_transformers(self) -> None:
         model = self._installed_model(Path("/missing/model"))
 
@@ -130,6 +137,12 @@ class ModelTests(unittest.TestCase):
                     TransformersRuntime(model)
 
         verify.assert_called_once_with(model)
+
+    def test_transformers_runtime_refuses_unacknowledged_remote_code(self) -> None:
+        model = self._installed_model(Path("/models/unsafe"), trust_remote_code=True)
+
+        with self.assertRaisesRegex(Exception, "acknowledged"):
+            TransformersRuntime(model)
 
     def test_offline_search_reports_discovery_facts_without_qualification_claims(self) -> None:
         catalog = {

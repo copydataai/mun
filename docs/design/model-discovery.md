@@ -74,6 +74,18 @@ They cannot prove model safety, parser safety, absence of malicious behavior, or
 semantic quality. An installation with `trust_remote_code` is always described
 as unsafe, never tested or safe, even when all bytes verify.
 
+Remote repository code is limited to a verified immutable snapshot. First use
+requires `--acknowledge-remote-code`. Automation may instead configure the exact
+`repository@revision` acknowledgement and no broader value. Runtime provenance
+retains `unsafe_remote_code`, and all resulting transcript content remains
+tainted and agent-ineligible. Remote-code models never receive tested claims.
+
+Model and transient cleanup return deletion receipts containing the exact
+managed paths attempted, the app-visible result, and estimated bytes. The scope
+excludes backups, APFS snapshots, swap, filesystem remnants, transcript exports,
+and third-party caches. Receipts do not claim universal erasure, and deletion
+outside the managed model directory is refused.
+
 ## Prototype verdict
 
 The accepted concept was **C — Task-first setup** from

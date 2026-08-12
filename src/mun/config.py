@@ -9,7 +9,7 @@ from typing import Any
 
 from .errors import MunError
 
-CONFIG_KEYS = {"model", "model_dir", "output_dir", "device", "offline"}
+CONFIG_KEYS = {"model", "model_dir", "output_dir", "device", "offline", "remote_code_acknowledgement"}
 
 
 def user_config_dir() -> Path:
