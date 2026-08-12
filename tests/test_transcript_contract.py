@@ -405,7 +405,7 @@ class TranscriptContractTests(unittest.TestCase):
                 return self.index, completed_result
 
             def cancel(self):
-                return True
+                return self.index == 1
 
         class Executor:
             def __init__(self, **kwargs):
@@ -453,10 +453,21 @@ class TranscriptContractTests(unittest.TestCase):
             receipt = json.loads((root / "out" / "mun-batch-interruption.json").read_text(encoding="utf-8"))
             self.assertTrue((root / "out" / "one.json").is_file())
 
-        self.assertEqual([item["status"] for item in receipt["files"]], ["completed", "cancelled"])
-        self.assertEqual(receipt["counts"]["cancelled"], 1)
+        self.assertEqual(
+            [item["status"] for item in receipt["files"]],
+            ["completed", "cancelled", "cancelled"],
+        )
+        self.assertEqual(receipt["counts"]["cancelled"], 2)
         self.assertEqual(receipt["files"][1]["source"]["relative_path"], "two.wav")
-        self.assertEqual(receipt["queued_unstarted_sources"], [{"name": "three.wav", "relative_path": "three.wav"}])
+        self.assertEqual(receipt["files"][2]["source"]["relative_path"], "three.wav")
+        self.assertEqual(receipt["queued_unstarted_sources"], [])
+        self.assertEqual(
+            receipt["unfinished_unknown_sources"],
+            [
+                {"name": "two.wav", "relative_path": "two.wav"},
+                {"name": "three.wav", "relative_path": "three.wav"},
+            ],
+        )
 
     def test_unrelated_txt_blocks_without_fabricating_transcript_content(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -545,6 +556,26 @@ class TranscriptContractTests(unittest.TestCase):
                 summaries, failures = run_batch(
                     [media], self.model, Path(temporary), ["json"], TranscriptionOptions(), False,
                     lambda _: None, runtime=changed_runtime,
+                )
+
+        self.assertEqual(summaries[0].reuse_status, "conflict")
+        self.assertEqual(len(failures), 1)
+
+    def test_missing_runtime_artifact_identity_rejects_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "file.wav"
+            source.write_bytes(b"audio")
+            media = SourceMedia(source, Path(source.name))
+            canonical = run_transcription_workflow(
+                [media], self.model, TranscriptionOptions(), runtime=self.runtime
+            )[0]
+            (Path(temporary) / "file.json").write_text(canonical.to_json(), encoding="utf-8")
+            unbound_runtime = FakeSpeechRuntime(Transcript("unused", [], "en"))
+
+            with patch("mun.core.verify_installed_model", return_value=VerificationResult("verified", "a" * 64)):
+                summaries, failures = run_batch(
+                    [media], self.model, Path(temporary), ["json"], TranscriptionOptions(), False,
+                    lambda _: None, runtime=unbound_runtime,
                 )
 
         self.assertEqual(summaries[0].reuse_status, "conflict")

@@ -178,12 +178,17 @@ def _persist_batch_interruption(
     output_dir: Path,
     results: list[TranscriptResult],
     queued_unstarted: list[SourceMedia],
+    unfinished_unknown: list[SourceMedia] | None = None,
 ) -> None:
     payload = {
         **make_batch_result(results).to_dict(),
         "status": "cancelled",
         "queued_unstarted_sources": [
             {"name": item.source.name, "relative_path": str(item.relative)} for item in queued_unstarted
+        ],
+        "unfinished_unknown_sources": [
+            {"name": item.source.name, "relative_path": str(item.relative)}
+            for item in unfinished_unknown or []
         ],
     }
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -244,7 +249,7 @@ def _matches_reuse_identity(
     provenance = result.provenance
     environment = provenance.runtime.environment
     info = runtime.info
-    runtime_artifact_sha256 = getattr(runtime, "model_artifact_sha256", artifact_sha256)
+    runtime_artifact_sha256 = getattr(runtime, "model_artifact_sha256", None)
     return (
         result.status == "completed"
         and result.source.name == media.source.name
@@ -422,7 +427,11 @@ def _infer_effective_device(requested_device: str) -> str:
     return detect_device(requested_device, torch)
 
 
-def _batch_provenance_runtime(requested_device: str, effective_device: str) -> Any:
+def _batch_provenance_runtime(
+    requested_device: str,
+    effective_device: str,
+    verified_model_artifact_sha256: str | None = None,
+) -> Any:
     from .runtime import RuntimeInfo
 
     try:
@@ -438,7 +447,10 @@ def _batch_provenance_runtime(requested_device: str, effective_device: str) -> A
         precision=precision,
         model_type="transformers",
     )
-    return SimpleNamespace(info=info)
+    return SimpleNamespace(
+        info=info,
+        model_artifact_sha256=verified_model_artifact_sha256,
+    )
 
 
 def discover_media(
@@ -579,12 +591,20 @@ def run_batch(
         if json_path is not None:
             if model_verification is None:
                 model_verification = verify_installed_model(model)
-            if reuse_runtime is None:
-                try:
-                    reuse_effective_device = _infer_effective_device(options.device)
-                    reuse_runtime = _batch_provenance_runtime(options.device, reuse_effective_device)
-                except MunError:
-                    reuse_runtime = None
+            if (
+                model_verification.status in {"verified", "unsafe_remote_code"}
+                and model_verification.artifact_digest is not None
+            ):
+                if reuse_runtime is None:
+                    try:
+                        reuse_effective_device = _infer_effective_device(options.device)
+                        reuse_runtime = _batch_provenance_runtime(
+                            options.device,
+                            reuse_effective_device,
+                            verified_model_artifact_sha256=model_verification.artifact_digest,
+                        )
+                    except MunError:
+                        reuse_runtime = None
             if (
                 model_verification.status in {"verified", "unsafe_remote_code"}
                 and model_verification.artifact_digest is not None
@@ -748,18 +768,20 @@ def run_batch(
             queued_results[index] = result
 
         unfinished = [(index, item) for index, item, _ in queued if index not in completed]
-        queued_unstarted: list[SourceMedia] = []
-        if unfinished:
-            active_index, active_media = unfinished[0]
-            queued_results[active_index] = _cancelled_result(
-                active_media, model, options, fallback_runtime, queued_status[active_index]
+        for unfinished_index, unfinished_media in unfinished:
+            queued_results[unfinished_index] = _cancelled_result(
+                unfinished_media,
+                model,
+                options,
+                fallback_runtime,
+                queued_status[unfinished_index],
             )
-            queued_unstarted = [item for _, item in unfinished[1:]]
 
         _persist_batch_interruption(
             output_dir,
             [queued_results[index] for index in sorted(queued_results)],
-            queued_unstarted,
+            [],
+            [item for _, item in unfinished],
         )
         raise
     else:
