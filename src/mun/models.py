@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from hashlib import sha256
 from importlib.resources import files
@@ -229,23 +229,26 @@ def download_model(
 
 
 def remove_model(root: Path, target: str) -> tuple[InstalledModel, int]:
-    receipt = remove_model_with_receipt(root, target)
-    if receipt.removed_model is None:
-        raise MunError(f"No managed model matches: {target}")
-    return receipt.removed_model, receipt.estimated_bytes
+    receipt, model = _remove_model(root, target)
+    return model, receipt.estimated_bytes
 
 
 def remove_model_with_receipt(root: Path, target: str) -> DeletionReceipt:
+    receipt, _ = _remove_model(root, target)
+    return receipt
+
+
+def _remove_model(root: Path, target: str) -> tuple[DeletionReceipt, InstalledModel]:
     matches = [
         model
         for model in installed_models(root)
         if model.id == target or model.path == str(Path(target).expanduser().resolve())
     ]
     if not matches:
-        raise MunError(f"No managed model matches: {target}")
+        raise MunError(f"No managed model matches: {_redact_private_path(str(target))}")
     if len(matches) > 1:
         revisions = ", ".join(model.revision[:12] for model in matches)
-        raise MunError(f"Multiple revisions match {target}; use an installed path: {revisions}")
+        raise MunError(f"Multiple revisions match {_redact_private_path(str(target))}; use an installed path: {revisions}")
     model = matches[0]
     path = Path(model.path).resolve()
     root = root.resolve()
@@ -253,7 +256,9 @@ def remove_model_with_receipt(root: Path, target: str) -> DeletionReceipt:
         raise MunError("Refusing to remove a directory not managed by Mun")
     size = sum(file.stat().st_size for file in path.rglob("*") if file.is_file())
     shutil.rmtree(path)
-    return DeletionReceipt("model", (str(path),), "deleted", size, removed_model=model)
+    identifier = _deletion_path_identifier(root, path)
+    receipt = DeletionReceipt("model", (identifier,), "deleted", size, removed_model=replace(model, path=identifier))
+    return receipt, model
 
 
 def remove_transient_with_receipt(root: Path, target: Path) -> DeletionReceipt:
@@ -261,18 +266,31 @@ def remove_transient_with_receipt(root: Path, target: Path) -> DeletionReceipt:
     path = target.resolve()
     if path.parent != root or not path.name.startswith(".") or not path.name.endswith(".download"):
         raise MunError("Refusing to remove a transient path outside Mun's managed model directory")
+    identifier = _deletion_path_identifier(root, path)
     if not path.exists():
-        return DeletionReceipt("transient", (str(path),), "not_found", 0)
+        return DeletionReceipt("transient", (identifier,), "not_found", 0)
     size = sum(file.stat().st_size for file in path.rglob("*") if file.is_file())
     shutil.rmtree(path)
-    return DeletionReceipt("transient", (str(path),), "deleted", size)
+    return DeletionReceipt("transient", (identifier,), "deleted", size)
 
 
 def _discard_transient(root: Path, target: Path) -> DeletionReceipt:
     try:
         return remove_transient_with_receipt(root, target)
     except OSError:
-        return DeletionReceipt("transient", (str(target.resolve()),), "not_found", 0)
+        identifier = _deletion_path_identifier(root.resolve(), target.resolve())
+        return DeletionReceipt("transient", (identifier,), "not_found", 0)
+
+
+def _deletion_path_identifier(root: Path, path: Path) -> str:
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return _redact_private_path(str(path))
+
+
+def _redact_private_path(value: str) -> str:
+    return value.replace(str(Path.home()), "~")
 
 
 def model_details(root: Path, target: str) -> dict[str, Any]:

@@ -442,11 +442,14 @@ def command_models(args: argparse.Namespace) -> int:
                 _print_mapping(details["catalog"])
         return 0
     if args.models_command == "remove":
-        model = find_installed(root, args.target)
-        if not args.yes and not _confirm(f"Remove {model.id}@{model.revision[:12]}?"):
-            print("Cancelled.")
-            return 0
-        receipt = remove_model_with_receipt(root, model.path)
+        try:
+            model = find_installed(root, args.target)
+            if not args.yes and not _confirm(f"Remove {model.id}@{model.revision[:12]}?"):
+                print("Cancelled.")
+                return 0
+            receipt = remove_model_with_receipt(root, model.path)
+        except MunError as exc:
+            raise MunError(_redact_home(str(exc))) from exc
         print(json.dumps(receipt.to_dict(), indent=2))
         return 0
     raise MunError("Unknown models command")
@@ -557,7 +560,7 @@ def _confirm(prompt: str) -> bool:
 
 def _redact_home(value: str) -> str:
     home = str(Path.home())
-    return value.replace(home, "~") if value.startswith(home) else value
+    return value.replace(home, "~")
 
 
 def _existing_ancestor(path: Path) -> Path:

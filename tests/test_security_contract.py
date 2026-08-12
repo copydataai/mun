@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +12,11 @@ from mun.runtime import FakeSpeechRuntime
 
 
 class SecurityContractTests(unittest.TestCase):
+    def assert_private_home_absent(self, value: object) -> None:
+        serialized = json.dumps(value)
+        self.assertNotIn(str(Path.home()), serialized)
+        self.assertNotIn(Path.home().name, serialized)
+
     def test_canonical_results_expose_typed_taint_and_agent_ineligibility(self) -> None:
         runtime = FakeSpeechRuntime(Transcript("Model words", [Segment("Model words", 0.0, 1.0)], "en"))
         media = SourceMedia(Path("source.wav"), Path("source.wav"))
@@ -32,7 +38,7 @@ class SecurityContractTests(unittest.TestCase):
             self.assertNotIn("trusted", result["agent_eligibility"]["reason"].lower())
 
     def test_model_deletion_receipt_states_exact_scope_and_exclusions(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
             root = Path(temporary) / "models"
             target = root / "owner--model--abc"
             target.mkdir(parents=True)
@@ -42,7 +48,11 @@ class SecurityContractTests(unittest.TestCase):
 
             receipt = remove_model_with_receipt(root, "owner/model")
 
-        self.assertEqual(receipt.attempted_paths, (str(target.resolve()),))
+        payload = receipt.to_dict()
+        self.assertEqual(payload["attempted_paths"], ["owner--model--abc"])
+        self.assertEqual(payload["removed_model"]["path"], "owner--model--abc")
+        self.assertEqual(receipt.removed_model.path, "owner--model--abc")
+        self.assert_private_home_absent(payload)
         self.assertEqual(receipt.result, "deleted")
         self.assertGreater(receipt.estimated_bytes, 4)
         self.assertIn("backups", receipt.exclusions)
@@ -53,17 +63,47 @@ class SecurityContractTests(unittest.TestCase):
         self.assertIn("third-party caches", receipt.exclusions)
         self.assertFalse(target.exists())
 
+    def test_transient_deletion_receipts_redact_deleted_and_missing_paths(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            root = Path(temporary) / "models"
+            root.mkdir()
+            target = root / ".owner--model.download"
+            target.mkdir()
+            (target / "partial").write_bytes(b"1234")
+
+            deleted = remove_transient_with_receipt(root, target).to_dict()
+            missing = remove_transient_with_receipt(root, target).to_dict()
+
+        self.assertEqual(deleted["attempted_paths"], [".owner--model.download"])
+        self.assertEqual(deleted["result"], "deleted")
+        self.assertEqual(missing["attempted_paths"], [".owner--model.download"])
+        self.assertEqual(missing["result"], "not_found")
+        self.assert_private_home_absent(deleted)
+        self.assert_private_home_absent(missing)
+
+    def test_model_deletion_error_redacts_an_absolute_target(self) -> None:
+        root = Path.home() / "private-owner" / "models"
+        target = root / "missing-model"
+
+        with self.assertRaises(MunError) as raised:
+            remove_model_with_receipt(root, str(target))
+
+        self.assertIn("~/private-owner/models/missing-model", str(raised.exception))
+        self.assert_private_home_absent(str(raised.exception))
+
     def test_transient_deletion_refuses_paths_outside_managed_root(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
             root = Path(temporary) / "models"
             root.mkdir()
             outside = Path(temporary) / "secret.txt"
             outside.write_text("secret", encoding="utf-8")
 
-            with self.assertRaisesRegex(MunError, "managed"):
+            with self.assertRaises(MunError) as raised:
                 remove_transient_with_receipt(root, outside)
 
             self.assertTrue(outside.exists())
+            self.assertIn("managed", str(raised.exception))
+            self.assert_private_home_absent(str(raised.exception))
 
 
 if __name__ == "__main__":

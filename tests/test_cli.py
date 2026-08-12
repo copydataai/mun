@@ -13,11 +13,45 @@ from unittest.mock import patch
 
 from mun.cli import _existing_ancestor, build_parser, command_transcribe, interactive_wizard, main
 from mun.core import SourceMedia
-from mun.models import InstalledModel
+from mun.models import InstalledModel, _write_metadata
 from mun.transcript import SourceRecord, TranscriptResult, make_provenance
 
 
 class CliTests(unittest.TestCase):
+    def assert_private_home_absent(self, value: str) -> None:
+        self.assertNotIn(str(Path.home()), value)
+        self.assertNotIn(Path.home().name, value)
+
+    def test_model_removal_cli_redacts_home_paths_in_receipt(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            root = Path(temporary) / "models"
+            target = root / "owner--model--abc"
+            target.mkdir(parents=True)
+            model = InstalledModel("owner/model", "abc", str(target), "2026-08-12T00:00:00Z")
+            _write_metadata(target, model)
+            output = io.StringIO()
+
+            with patch("mun.cli.load_config", return_value={}), contextlib.redirect_stdout(output):
+                status = main(["models", "--model-dir", str(root), "remove", "owner/model", "--yes"])
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(status, 0)
+        self.assertEqual(payload["attempted_paths"], ["owner--model--abc"])
+        self.assertEqual(payload["removed_model"]["path"], "owner--model--abc")
+        self.assert_private_home_absent(output.getvalue())
+
+    def test_model_removal_cli_redacts_home_paths_in_error_diagnostics(self) -> None:
+        missing = Path.home() / "private-owner" / "missing-model"
+        errors = io.StringIO()
+
+        with patch("mun.cli.load_config", return_value={}), contextlib.redirect_stderr(errors):
+            status = main(["models", "--model-dir", str(missing.parent), "remove", str(missing), "--yes"])
+
+        self.assertEqual(status, 1)
+        self.assertIn("No installed model", errors.getvalue())
+        self.assertIn("~/private-owner/missing-model", errors.getvalue())
+        self.assert_private_home_absent(errors.getvalue())
+
     def test_review_commands_parse_narrow_apply_and_render_operations(self) -> None:
         apply_args = build_parser().parse_args(
             ["review", "apply", "machine.json", "corrections.json", "-o", "corrected.json"]
