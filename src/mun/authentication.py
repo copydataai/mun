@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 from hashlib import sha256
 from typing import Any, Mapping
 
@@ -13,7 +14,9 @@ from .errors import MunError
 
 
 class AuthenticationError(MunError):
-    pass
+    def __init__(self, message: str, code: str = "authentication_invalid") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def _digest(value: Mapping[str, Any]) -> str:
@@ -57,24 +60,53 @@ def verify_artifact(
     receipt: Mapping[str, Any],
     envelope: Mapping[str, Any],
 ) -> dict[str, Any]:
+    if not isinstance(artifact, Mapping):
+        raise AuthenticationError("Artifact must be a JSON object", "artifact_malformed")
+    if not isinstance(receipt, Mapping):
+        raise AuthenticationError("Receipt must be a JSON object", "receipt_malformed")
+    if not isinstance(envelope, Mapping):
+        raise AuthenticationError("Authentication envelope must be a JSON object", "envelope_malformed")
+    required = {
+        "schema_version", "envelope_kind", "algorithm", "canonicalization", "artifact_schema_version",
+        "artifact_sha256", "receipt_sha256", "producer_role", "public_key", "public_key_fingerprint",
+        "signature", "claims",
+    }
+    if set(envelope) != required:
+        raise AuthenticationError("Authentication envelope fields are missing or ambiguous", "envelope_fields")
+    if envelope.get("envelope_kind") != "mun-producer-authentication":
+        raise AuthenticationError("Unsupported authentication envelope kind", "envelope_kind")
     if envelope.get("schema_version") != 1 or envelope.get("canonicalization") != "mun-canonical-json-v1":
-        raise AuthenticationError("Ambiguous canonicalization or unsupported envelope schema")
+        raise AuthenticationError("Ambiguous canonicalization or unsupported envelope schema", "canonicalization")
     if envelope.get("algorithm") != "Ed25519":
-        raise AuthenticationError("Unknown authentication algorithm")
+        raise AuthenticationError("Unknown authentication algorithm", "algorithm")
+    claims = envelope.get("claims")
+    expected_claims = {"accuracy": False, "reviewer_identity": False, "consent": False, "authorization": False}
+    if claims != expected_claims:
+        raise AuthenticationError("Authentication claims are malformed or ambiguous", "claims")
+    for field in ("artifact_sha256", "receipt_sha256", "public_key_fingerprint"):
+        value = envelope.get(field)
+        if not isinstance(value, str) or len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+            raise AuthenticationError("Authentication digest fields are malformed", "envelope_fields")
+    if not isinstance(envelope.get("producer_role"), str) or not envelope["producer_role"].strip():
+        raise AuthenticationError("Producer-declared role is malformed", "producer_role")
     if envelope.get("artifact_schema_version") != artifact.get("schema_version"):
-        raise AuthenticationError("Artifact schema version mismatch")
+        raise AuthenticationError("Artifact schema version mismatch", "artifact_schema")
     if envelope.get("artifact_sha256") != _digest(artifact):
-        raise AuthenticationError("Authenticated artifact content was altered")
+        raise AuthenticationError("Authenticated artifact content was altered", "artifact_altered")
     if envelope.get("receipt_sha256") != _digest(receipt):
-        raise AuthenticationError("Authenticated receipt was altered")
+        raise AuthenticationError("Authenticated receipt was altered", "receipt_altered")
     try:
-        public_bytes = base64.b64decode(str(envelope["public_key"]), validate=True)
-        signature = base64.b64decode(str(envelope["signature"]), validate=True)
-    except (KeyError, ValueError) as exc:
-        raise AuthenticationError("Malformed public key or signature") from exc
+        if not isinstance(envelope["public_key"], str) or not isinstance(envelope["signature"], str):
+            raise ValueError
+        public_bytes = base64.b64decode(envelope["public_key"], validate=True)
+        signature = base64.b64decode(envelope["signature"], validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise AuthenticationError("Malformed public key or signature", "encoding") from exc
+    if len(public_bytes) != 32 or len(signature) != 64:
+        raise AuthenticationError("Malformed public key or signature", "encoding")
     fingerprint = sha256(public_bytes).hexdigest()
     if envelope.get("public_key_fingerprint") != fingerprint:
-        raise AuthenticationError("Public key fingerprint mismatch")
+        raise AuthenticationError("Public key fingerprint mismatch", "fingerprint")
     statement = {
         key: envelope[key]
         for key in (
@@ -84,8 +116,8 @@ def verify_artifact(
     }
     try:
         Ed25519PublicKey.from_public_bytes(public_bytes).verify(signature, canonical_json_bytes(statement))
-    except (ValueError, InvalidSignature, KeyError) as exc:
-        raise AuthenticationError("Malformed or invalid producer signature") from exc
+    except (ValueError, InvalidSignature) as exc:
+        raise AuthenticationError("Malformed or invalid producer signature", "signature") from exc
     return {
         "valid": True,
         "algorithm": "Ed25519",

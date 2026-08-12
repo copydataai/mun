@@ -16,7 +16,7 @@ from typing import Any
 from . import __version__
 from .acceptance import create_acceptance
 from .artifacts import canonical_json_bytes
-from .authentication import sign_artifact, verify_artifact
+from .authentication import AuthenticationError, sign_artifact, verify_artifact
 from .journal import resume_batch_journal
 from .quality import DeterministicFixtureRuntime, PublicTranscriptionAdapter, run_quality_qualification
 from .config import config_path, load_config, reset_config, set_config
@@ -200,10 +200,15 @@ def main(argv: list[str] | None = None) -> int:
             args.output.write_bytes(canonical_json_bytes(envelope) + b"\n")
             return 0
         if args.command == "verify":
-            artifact = json.loads(args.artifact.read_text(encoding="utf-8"))
-            receipt = json.loads(args.receipt.read_text(encoding="utf-8"))
-            envelope = json.loads(args.envelope.read_text(encoding="utf-8"))
-            print(json.dumps(verify_artifact(artifact, receipt, envelope), sort_keys=True))
+            try:
+                artifact = _load_authentication_json(args.artifact, "artifact")
+                receipt = _load_authentication_json(args.receipt, "receipt")
+                envelope = _load_authentication_json(args.envelope, "envelope")
+                outcome = verify_artifact(artifact, receipt, envelope)
+            except AuthenticationError as exc:
+                print(json.dumps({"valid": False, "error": {"code": exc.code, "message": str(exc)}}, sort_keys=True))
+                return 1
+            print(json.dumps(outcome, sort_keys=True))
             return 0
         if args.command == "resume":
             print(json.dumps(resume_batch_journal(args.journal), sort_keys=True))
@@ -236,6 +241,30 @@ def main(argv: list[str] | None = None) -> int:
     except MunError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+
+
+def _load_authentication_json(path: Path, label: str) -> Any:
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise AuthenticationError(f"Cannot read {label} JSON", f"{label}_unreadable") from exc
+    if len(data) > 1024 * 1024:
+        raise AuthenticationError(f"{label.capitalize()} JSON exceeds the verification limit", f"{label}_too_large")
+
+    def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise AuthenticationError(f"{label.capitalize()} JSON contains duplicate fields", f"{label}_ambiguous")
+            value[key] = item
+        return value
+
+    try:
+        return json.loads(data.decode("utf-8"), object_pairs_hook=reject_duplicates)
+    except AuthenticationError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AuthenticationError(f"{label.capitalize()} JSON is malformed", f"{label}_malformed") from exc
 
 
 def interactive_wizard() -> int:
