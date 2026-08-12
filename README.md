@@ -129,6 +129,24 @@ mun transcribe recordings/ --summary-json > result.json
 
 Progress and warnings go to stderr, so redirected stdout remains valid.
 
+### Apply human corrections without changing the machine result
+
+Create a correction-set JSON that names the exact parent `result_digest` and
+targets segments by transcript kind, segment ID, and SHA-256 digest of the exact
+original segment text. Then validate and export a separate corrected record:
+
+```sh
+mun review apply transcript.json corrections.json -o transcript.corrected.json
+mun review render transcript.json --view machine --format txt
+mun review render transcript.json --corrections corrections.json --view corrected --format srt
+```
+
+`review apply` refuses to overwrite an existing output. Parent, target, or
+original-text mismatches fail closed. The canonical machine JSON is never
+rewritten. Corrected TXT, SRT, and VTT retain the machine segment timings, while
+corrected JSON records `reviewed` or `unreviewed`, the parent and correction-set
+identities, and a distinct export digest.
+
 ## Outputs
 
 | Format | Purpose |
@@ -145,6 +163,10 @@ Each attempt persists `<name>.receipt.json` with one of `completed`, `cancelled`
 Batch summary counts distinguish newly processed files from `reused_verified`, `conflict`, `incomplete_output_set`, and `overwrite_required` plans. A verified reuse can succeed without loading the speech model. Conflicts and incomplete sets are recoverable by moving the existing files or rerunning with `--overwrite`.
 
 Artifact validation establishes internal consistency only. A matching digest proves that the JSON has not changed relative to its own recorded digest, not that the transcript was honestly produced, that the recorded provenance is true, or that a trusted producer signed it. Mun does not currently provide producer signatures.
+
+Correction content and notes are untrusted data. A human review state records a
+workflow state only. It does not claim truth, authenticity, honesty, accuracy,
+consent, custody, or reviewer identity.
 
 FFmpeg converts source media into temporary mono audio when needed. Temporary audio is removed after success, failure, or cancellation. Media already suitable for inference can bypass conversion.
 
@@ -221,7 +243,7 @@ mun transcribe audio.wav --device cpu
 
 ## Scope
 
-Mun does not provide cloud inference, a web server, transcript editing, summarization, speaker recognition, training, fine-tuning, or model conversion. Speaker diarization is the next optional capability only if its gated model and dependencies can remain separate from plain transcription.
+Mun does not provide cloud inference, a web server, an interactive transcript editor, summarization, speaker recognition, training, fine-tuning, or model conversion. Its review commands only validate immutable correction overlays and render machine or corrected views. Speaker diarization is the next optional capability only if its gated model and dependencies can remain separate from plain transcription.
 
 A graphical interface may eventually wrap the same workflow. Mun has no GUI dependency or implementation scaffold today.
 

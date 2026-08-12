@@ -24,7 +24,8 @@ from .core import (
     run_transcription_workflow,
 )
 from .errors import MunError
-from .transcript import make_batch_result
+from .review import CorrectionError, CorrectionSet, apply_corrections, render_reviewed
+from .transcript import TranscriptResult, make_batch_result
 from .models import (
     download_model,
     find_installed,
@@ -100,6 +101,18 @@ def build_parser() -> argparse.ArgumentParser:
     config_reset = config_subcommands.add_parser("reset")
     config_reset.add_argument("--yes", action="store_true")
 
+    review = subcommands.add_parser("review", help="apply or render transcript correction overlays")
+    review_subcommands = review.add_subparsers(dest="review_command", required=True)
+    review_apply = review_subcommands.add_parser("apply", help="validate corrections and write corrected JSON")
+    review_apply.add_argument("machine", type=Path, help="canonical machine-result JSON")
+    review_apply.add_argument("corrections", type=Path, help="correction-set JSON")
+    review_apply.add_argument("-o", "--output", type=Path, required=True, help="new corrected JSON path")
+    review_render = review_subcommands.add_parser("render", help="render the machine or corrected transcript")
+    review_render.add_argument("machine", type=Path, help="canonical machine-result JSON")
+    review_render.add_argument("--corrections", type=Path, help="correction-set JSON")
+    review_render.add_argument("--view", choices=("machine", "corrected"), default="machine")
+    review_render.add_argument("--format", choices=("txt", "json", "srt", "vtt"), default="txt")
+
     doctor = subcommands.add_parser("doctor", help="diagnose the local runtime")
     doctor.add_argument("--json", action="store_true")
     return parser
@@ -121,6 +134,8 @@ def main(argv: list[str] | None = None) -> int:
             return command_models(args)
         if args.command == "config":
             return command_config(args)
+        if args.command == "review":
+            return command_review(args)
         if args.command == "doctor":
             return command_doctor(args)
         parser.print_help()
@@ -251,6 +266,44 @@ def command_transcribe(args: argparse.Namespace) -> int:
         if not args.summary_json and failures:
             print(f"Completed with {len(failures)} failure(s).", file=sys.stderr)
         return 1 if incomplete else 0
+
+
+def command_review(args: argparse.Namespace) -> int:
+    machine = _read_machine_result(args.machine)
+    if args.review_command == "apply":
+        corrected = apply_corrections(machine, _read_correction_set(args.corrections))
+        try:
+            with args.output.open("x", encoding="utf-8", newline="\n") as handle:
+                handle.write(corrected.to_json())
+        except FileExistsError as exc:
+            raise MunError(f"Refusing to overwrite existing corrected export: {args.output}") from exc
+        except OSError as exc:
+            raise MunError(f"Cannot write corrected export {args.output}: {exc}") from exc
+        return 0
+
+    corrected = None
+    if args.view == "corrected":
+        if args.corrections is None:
+            raise CorrectionError("--corrections is required for corrected rendering")
+        corrected = apply_corrections(machine, _read_correction_set(args.corrections))
+    sys.stdout.write(render_reviewed(args.format, machine, corrected, args.view))
+    return 0
+
+
+def _read_machine_result(path: Path) -> TranscriptResult:
+    try:
+        return TranscriptResult.from_json(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise MunError(f"Cannot read machine result {path}: {exc}") from exc
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise MunError(f"Invalid machine result {path}: {exc}") from exc
+
+
+def _read_correction_set(path: Path) -> CorrectionSet:
+    try:
+        return CorrectionSet.from_json(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise MunError(f"Cannot read correction set {path}: {exc}") from exc
 
 
 def command_models(args: argparse.Namespace) -> int:

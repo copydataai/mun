@@ -17,6 +17,45 @@ from mun.transcript import SourceRecord, TranscriptResult, make_provenance
 
 
 class CliTests(unittest.TestCase):
+    def test_review_commands_parse_narrow_apply_and_render_operations(self) -> None:
+        apply_args = build_parser().parse_args(
+            ["review", "apply", "machine.json", "corrections.json", "-o", "corrected.json"]
+        )
+        render_args = build_parser().parse_args(
+            ["review", "render", "machine.json", "--corrections", "corrections.json", "--view", "corrected", "--format", "srt"]
+        )
+
+        self.assertEqual(apply_args.review_command, "apply")
+        self.assertEqual(apply_args.output, Path("corrected.json"))
+        self.assertEqual(render_args.review_command, "render")
+        self.assertEqual(render_args.view, "corrected")
+        self.assertEqual(render_args.format, "srt")
+
+    def test_review_apply_and_render_do_not_rewrite_machine_json(self) -> None:
+        from tests.test_review import correction_payload, machine_result
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            machine = root / "machine.json"
+            corrections = root / "corrections.json"
+            corrected = root / "corrected.json"
+            result = machine_result()
+            machine.write_text(result.to_json(), encoding="utf-8")
+            original_bytes = machine.read_bytes()
+            corrections.write_text(json.dumps(correction_payload(result)), encoding="utf-8")
+
+            self.assertEqual(main(["review", "apply", str(machine), str(corrections), "-o", str(corrected)]), 0)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                status = main(
+                    ["review", "render", str(machine), "--corrections", str(corrections), "--view", "corrected", "--format", "txt"]
+                )
+
+            self.assertEqual(status, 0)
+            self.assertEqual(output.getvalue(), "Hello world. Next line.\n")
+            self.assertEqual(machine.read_bytes(), original_bytes)
+            self.assertEqual(json.loads(corrected.read_text(encoding="utf-8"))["review_state"], "reviewed")
+
     def test_guided_workflow_uses_an_installed_model_without_downloading_again(self) -> None:
         model = InstalledModel(
             "owner/model",

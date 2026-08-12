@@ -150,6 +150,55 @@ Result identity proves only that a claimed record is consistent with its
 recorded derivation inputs and outputs. It does not prove recognition
 correctness, semantic accuracy, authenticity, or truth.
 
+## Immutable correction overlays
+
+Human corrections are stored separately from the canonical machine result. Mun
+never edits the machine-result object or JSON. A schema-version-1 correction set
+contains:
+
+```json
+{
+  "schema_version": 1,
+  "correction_set_id": "review-2026-08-12-a",
+  "created_at": "2026-08-12T19:00:00Z",
+  "parent_result_digest": "exact-machine-result-digest",
+  "review_state": "reviewed",
+  "corrections": [
+    {
+      "transcript_kind": "original",
+      "segment_id": "segment_1",
+      "original_text_digest": "sha256-of-the-exact-original-segment-text",
+      "replacement": "Corrected text.",
+      "note": "Optional note, at most 500 characters."
+    }
+  ]
+}
+```
+
+`review_state` is explicitly `reviewed` or `unreviewed`. Targets are unique
+within a correction set. Application requires an exact parent digest, an
+existing transcript-kind and segment-ID pair, and a matching SHA-256 digest of
+the original segment's UTF-8 text. Any mismatch rejects the complete overlay;
+Mun does not partially apply it. Replacement text and notes remain untrusted
+data and are never interpreted as markup, commands, or proof.
+
+A machine-view JSON export explicitly records `view: "machine"`,
+`review_state: "unreviewed"`, and the unchanged machine `result_digest` as its
+export digest. A corrected JSON export is a derived envelope with
+`view: "corrected"`, the
+review state, parent result digest, correction-set ID and digest, a corrected
+transcript projection, and its own `export_digest`. It is distinct from the
+machine result and does not replace or acquire the machine `result_digest`.
+The correction-set digest covers its ID, timestamp, parent, review state, and
+all targets and replacement data using stable JSON encoding.
+Corrected TXT, SRT, and VTT select replacement text while retaining the machine
+segments' IDs, ordering, speakers, and timing intervals. The variant-level text
+is rebuilt from the corrected segments in source order.
+
+Human review records that a person handled the correction set. It does not
+establish truth, authenticity, honesty, semantic accuracy, consent, custody, or
+producer identity.
+
 ## Invariants
 
 - Status is `completed`, `partial`, `failed`, or `cancelled`. `partial` means at
@@ -227,7 +276,8 @@ All text files use UTF-8 and LF endings.
   explanatory comments. It is for people and configuration-aware tools, not
   the CLI machine protocol.
 - **SRT** and **VTT** project one cue per timed segment without merging,
-  splitting, line wrapping, or text correction. Cues retain source order and
+  splitting, or line wrapping. Machine view retains machine text; corrected
+  view selects a validated correction overlay. Cues retain source order and
   may overlap. A speaker label, when present, prefixes cue text as
   `[speaker_1] `. With English translation requested, Mun writes `.original`
   and `.en` files only for variants that contain timed segments.
