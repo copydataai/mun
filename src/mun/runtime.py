@@ -49,7 +49,6 @@ class TransformersRuntime:
             raise MunError(
                 f"Model integrity verification failed: {verification.status}{detail}. {verification.guidance}".strip()
             )
-        self.model_artifact_sha256 = verification.artifact_digest
         try:
             import torch
             from transformers import AutoConfig, pipeline
@@ -66,6 +65,14 @@ class TransformersRuntime:
                 dtype=dtype,
                 trust_remote_code=model.trust_remote_code,
             )
+            loaded_verification = verify_installed_model(model)
+            if (
+                loaded_verification.status not in {"verified", "unsafe_remote_code"}
+                or loaded_verification.artifact_digest is None
+                or loaded_verification.artifact_digest != verification.artifact_digest
+            ):
+                raise MunError("The installed model changed while the runtime was loading")
+            self.model_artifact_sha256 = loaded_verification.artifact_digest
             self.info = RuntimeInfo(
                 name="transformers",
                 version=_package_version("transformers"),

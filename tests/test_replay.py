@@ -34,11 +34,15 @@ class ReplayTests(unittest.TestCase):
         )
         self.transcript = Transcript("Hello world", [Segment("Hello world", 0.0, 1.25)], "en")
 
+    def _bind(self, runtime: FakeSpeechRuntime) -> FakeSpeechRuntime:
+        runtime.model_artifact_sha256 = "artifact-digest"
+        runtime.test_installed_model = self.model
+        return runtime
+
     def _fixture(self, root: Path):
         source = root / "source.wav"
         source.write_bytes(b"bounded replay source")
-        runtime = FakeSpeechRuntime(self.transcript)
-        runtime.model_artifact_sha256 = "artifact-digest"
+        runtime = self._bind(FakeSpeechRuntime(self.transcript))
         expected = run_transcription_workflow(
             [SourceMedia(source, Path("source.wav"))], self.model, TranscriptionOptions(timestamps=True), runtime=runtime
         )[0]
@@ -49,8 +53,7 @@ class ReplayTests(unittest.TestCase):
     def test_fake_runtime_replay_is_exact_for_canonical_and_export_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             source, result_path, _ = self._fixture(Path(temporary))
-            runtime = FakeSpeechRuntime(self.transcript)
-            runtime.model_artifact_sha256 = "artifact-digest"
+            runtime = self._bind(FakeSpeechRuntime(self.transcript))
 
             outcome = replay_result(result_path, source=source, model=self.model, runtime=runtime)
 
@@ -63,8 +66,7 @@ class ReplayTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             source, result_path, _ = self._fixture(Path(temporary))
             source.write_bytes(b"changed source")
-            runtime = CountingRuntime(self.transcript)
-            runtime.model_artifact_sha256 = "artifact-digest"
+            runtime = self._bind(CountingRuntime(self.transcript))
 
             outcome = replay_result(result_path, source=source, model=self.model, runtime=runtime)
 
@@ -76,8 +78,7 @@ class ReplayTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             source, result_path, _ = self._fixture(Path(temporary))
             changed_model = replace(self.model, revision="different")
-            runtime = CountingRuntime(self.transcript)
-            runtime.model_artifact_sha256 = "artifact-digest"
+            runtime = self._bind(CountingRuntime(self.transcript))
 
             model_outcome = replay_result(
                 result_path,
@@ -96,8 +97,7 @@ class ReplayTests(unittest.TestCase):
     def test_exact_normalized_diff_reports_semantic_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             source, result_path, _ = self._fixture(Path(temporary))
-            runtime = FakeSpeechRuntime(Transcript("Goodbye world", [Segment("Goodbye world", 0.0, 1.25)], "en"))
-            runtime.model_artifact_sha256 = "artifact-digest"
+            runtime = self._bind(FakeSpeechRuntime(Transcript("Goodbye world", [Segment("Goodbye world", 0.0, 1.25)], "en")))
 
             outcome = replay_result(result_path, source=source, model=self.model, runtime=runtime)
 
@@ -109,8 +109,7 @@ class ReplayTests(unittest.TestCase):
         tolerances = Path("fixtures/replay/live-tolerances.json")
         with tempfile.TemporaryDirectory() as temporary:
             source, result_path, _ = self._fixture(Path(temporary))
-            runtime = FakeSpeechRuntime(Transcript(" hello   world ", [Segment(" hello world ", 0.04, 1.29)], "en"))
-            runtime.model_artifact_sha256 = "artifact-digest"
+            runtime = self._bind(FakeSpeechRuntime(Transcript(" hello   world ", [Segment(" hello world ", 0.04, 1.29)], "en")))
 
             outcome = replay_result(
                 result_path, source=source, model=self.model, runtime=runtime, tolerance_file=tolerances
@@ -128,8 +127,7 @@ class ReplayTests(unittest.TestCase):
             payload["provenance"]["mun_version"] = "older-mun"
             payload.pop("result_digest")
             result_path.write_text(json.dumps(payload), encoding="utf-8")
-            runtime = FakeSpeechRuntime(self.transcript)
-            runtime.model_artifact_sha256 = "artifact-digest"
+            runtime = self._bind(FakeSpeechRuntime(self.transcript))
 
             outcome = replay_result(result_path, source=source, model=self.model, runtime=runtime)
 

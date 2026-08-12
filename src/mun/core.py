@@ -174,6 +174,21 @@ def _cancelled_result(
     )
 
 
+def _runtime_artifact_is_bound(runtime: Any, model: InstalledModel) -> bool:
+    artifact_sha256 = getattr(runtime, "model_artifact_sha256", None)
+    if not isinstance(artifact_sha256, str) or not artifact_sha256:
+        return False
+    test_model = getattr(runtime, "test_installed_model", None)
+    if test_model is not None:
+        return getattr(runtime.info, "name", None) == "test" and test_model == model
+    verification = verify_installed_model(model)
+    return (
+        verification.status in {"verified", "unsafe_remote_code"}
+        and verification.artifact_digest is not None
+        and artifact_sha256 == verification.artifact_digest
+    )
+
+
 def _persist_batch_interruption(
     output_dir: Path,
     results: list[TranscriptResult],
@@ -748,8 +763,10 @@ def run_batch(
 
             completed[index] = result
     except KeyboardInterrupt:
-        for future in futures:
-            future.cancel()
+        confirmed_cancelled: set[int] = set()
+        for future, future_index in futures.items():
+            if future_index not in completed and future.cancel():
+                confirmed_cancelled.add(future_index)
         executor.shutdown(wait=False, cancel_futures=True)
 
         for index in sorted(completed):
@@ -767,8 +784,8 @@ def run_batch(
                     )
             queued_results[index] = result
 
-        unfinished = [(index, item) for index, item, _ in queued if index not in completed]
-        for unfinished_index, unfinished_media in unfinished:
+        for unfinished_index in sorted(confirmed_cancelled):
+            unfinished_media = media_by_index[unfinished_index]
             queued_results[unfinished_index] = _cancelled_result(
                 unfinished_media,
                 model,
@@ -777,11 +794,17 @@ def run_batch(
                 queued_status[unfinished_index],
             )
 
+        unfinished_unknown = [
+            item
+            for index, item, _ in queued
+            if index not in completed and index not in confirmed_cancelled
+        ]
+
         _persist_batch_interruption(
             output_dir,
             [queued_results[index] for index in sorted(queued_results)],
             [],
-            [item for _, item in unfinished],
+            unfinished_unknown,
         )
         raise
     else:
@@ -816,8 +839,22 @@ def run_batch(
 def transcribe_source(runtime: Any, media: SourceMedia, model: InstalledModel, options: TranscriptionOptions) -> TranscriptResult:
     source_sha256 = _sha256_file(media.source)
     source = _source_record(media, source_sha256)
+    if not _runtime_artifact_is_bound(runtime, model):
+        return TranscriptResult(
+            schema_version=SCHEMA_VERSION,
+            status="failed",
+            source=source,
+            transcripts=[],
+            speakers=[],
+            diagnostics=[Diagnostic("error", "model_artifact_binding_failed", "Runtime model artifact binding could not be verified", "model", False)],
+            provenance=_provenance(runtime, model, options),
+            operation=_operation(runtime, options, source_sha256),
+            trust=make_trust(model.trust_remote_code),
+        )
     try:
         original, translated = runtime.transcribe(media.source, options)
+        if not _runtime_artifact_is_bound(runtime, model):
+            raise MunError("Runtime model artifact binding changed during inference")
         transcripts = [_variant("original", original, options.language, options.language is not None)]
         if translated:
             transcripts.append(_variant("english_translation", translated, "en", False))
@@ -832,14 +869,21 @@ def transcribe_source(runtime: Any, media: SourceMedia, model: InstalledModel, o
             operation=_operation(runtime, options, source_sha256),
             trust=make_trust(model.trust_remote_code),
         )
-    except Exception:
+    except Exception as exc:
+        binding_failed = isinstance(exc, MunError) and "artifact binding" in str(exc)
         return TranscriptResult(
             schema_version=SCHEMA_VERSION,
             status="failed",
             source=source,
             transcripts=[],
             speakers=[],
-            diagnostics=[Diagnostic("error", "transcription_failed", "Transcription failed", "transcription", False)],
+            diagnostics=[Diagnostic(
+                "error",
+                "model_artifact_binding_failed" if binding_failed else "transcription_failed",
+                "Runtime model artifact binding could not be verified" if binding_failed else "Transcription failed",
+                "model" if binding_failed else "transcription",
+                False,
+            )],
             provenance=_provenance(runtime, model, options),
             operation=_operation(runtime, options, source_sha256),
             trust=make_trust(model.trust_remote_code),

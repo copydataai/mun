@@ -34,6 +34,7 @@ class TranscriptContractTests(unittest.TestCase):
         self.media = SourceMedia(Path("/private/source.wav"), Path("batch/source.wav"))
         self.runtime = FakeSpeechRuntime(Transcript("Hello world", [Segment("Hello", 0.0, 1.25)], "en"))
         self.runtime.model_artifact_sha256 = "a" * 64
+        self.runtime.test_installed_model = self.model
 
     def test_workflow_returns_canonical_result(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -154,6 +155,8 @@ class TranscriptContractTests(unittest.TestCase):
             Transcript("Hola", [Segment("Hola", 0.0, 1.0)], "es"),
             Transcript("Hello", [Segment("Hello", 0.0, 1.0)], "en"),
         )
+        runtime.model_artifact_sha256 = "a" * 64
+        runtime.test_installed_model = self.model
         result = run_transcription_workflow(
             [self.media], self.model, TranscriptionOptions(translate=True), runtime=runtime
         )[0]
@@ -352,6 +355,8 @@ class TranscriptContractTests(unittest.TestCase):
 
         class InterruptingRuntime:
             info = runtime.info
+            model_artifact_sha256 = runtime.model_artifact_sha256
+            test_installed_model = runtime.test_installed_model
 
             def transcribe(self, source, options):
                 if source.name == "two.wav":
@@ -405,7 +410,7 @@ class TranscriptContractTests(unittest.TestCase):
                 return self.index, completed_result
 
             def cancel(self):
-                return self.index == 1
+                return self.index == 2
 
         class Executor:
             def __init__(self, **kwargs):
@@ -455,19 +460,57 @@ class TranscriptContractTests(unittest.TestCase):
 
         self.assertEqual(
             [item["status"] for item in receipt["files"]],
-            ["completed", "cancelled", "cancelled"],
+            ["completed", "cancelled"],
         )
-        self.assertEqual(receipt["counts"]["cancelled"], 2)
+        self.assertEqual(receipt["counts"]["cancelled"], 1)
         self.assertEqual(receipt["files"][1]["source"]["relative_path"], "two.wav")
-        self.assertEqual(receipt["files"][2]["source"]["relative_path"], "three.wav")
         self.assertEqual(receipt["queued_unstarted_sources"], [])
         self.assertEqual(
             receipt["unfinished_unknown_sources"],
-            [
-                {"name": "two.wav", "relative_path": "two.wav"},
-                {"name": "three.wav", "relative_path": "three.wav"},
-            ],
+            [{"name": "three.wav", "relative_path": "three.wav"}],
         )
+        self.assertNotIn("three.wav", [item["source"]["relative_path"] for item in receipt["files"]])
+
+    def test_completed_result_requires_runtime_artifact_binding(self) -> None:
+        runtime = FakeSpeechRuntime(Transcript("Hello", [], "en"))
+        runtime.test_installed_model = self.model
+
+        result = run_transcription_workflow(
+            [self.media], self.model, TranscriptionOptions(), runtime=runtime
+        )[0]
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.diagnostics[0].code, "model_artifact_binding_failed")
+
+    def test_completed_result_rejects_mismatched_test_model_binding(self) -> None:
+        runtime = FakeSpeechRuntime(Transcript("Hello", [], "en"))
+        runtime.model_artifact_sha256 = "a" * 64
+        runtime.test_installed_model = InstalledModel(
+            "other/model", "abc123", "/models/other", "2026-08-09T00:00:00+00:00"
+        )
+
+        result = run_transcription_workflow(
+            [self.media], self.model, TranscriptionOptions(), runtime=runtime
+        )[0]
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.diagnostics[0].code, "model_artifact_binding_failed")
+
+    def test_completed_result_rejects_digest_mismatched_with_installed_model(self) -> None:
+        runtime = FakeSpeechRuntime(Transcript("Hello", [], "en"))
+        runtime.info = replace(runtime.info, name="transformers")
+        runtime.model_artifact_sha256 = "a" * 64
+
+        with patch(
+            "mun.core.verify_installed_model",
+            return_value=VerificationResult("verified", "b" * 64),
+        ):
+            result = run_transcription_workflow(
+                [self.media], self.model, TranscriptionOptions(), runtime=runtime
+            )[0]
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.diagnostics[0].code, "model_artifact_binding_failed")
 
     def test_unrelated_txt_blocks_without_fabricating_transcript_content(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

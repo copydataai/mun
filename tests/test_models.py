@@ -138,6 +138,34 @@ class ModelTests(unittest.TestCase):
 
         verify.assert_called_once_with(model)
 
+    def test_transformers_runtime_reverifies_after_pipeline_load(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            artifact = directory / "config.json"
+            artifact.write_bytes(b"original")
+            model = self._installed_model(directory)
+            _write_manifest(directory, model)
+
+            torch = SimpleNamespace(
+                float16=object(),
+                float32=object(),
+                cuda=SimpleNamespace(is_available=lambda: False),
+                backends=SimpleNamespace(mps=SimpleNamespace(is_available=lambda: False)),
+            )
+            config = SimpleNamespace(model_type="whisper")
+
+            def mutate_during_load(*args, **kwargs):
+                artifact.write_bytes(b"changed")
+                return object()
+
+            transformers = SimpleNamespace(
+                AutoConfig=SimpleNamespace(from_pretrained=lambda *args, **kwargs: config),
+                pipeline=mutate_during_load,
+            )
+            with patch.dict("sys.modules", {"torch": torch, "transformers": transformers}):
+                with self.assertRaisesRegex(MunError, "changed while the runtime was loading"):
+                    TransformersRuntime(model, "cpu")
+
     def test_transformers_runtime_refuses_unacknowledged_remote_code(self) -> None:
         model = self._installed_model(Path("/models/unsafe"), trust_remote_code=True)
 
