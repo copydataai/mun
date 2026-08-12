@@ -165,6 +165,33 @@ class TranscriptContractTests(unittest.TestCase):
             self.assertEqual(summaries[0].status, "failed")
             self.assertFalse(any("private/source.wav" in failure["error"] for failure in failures))
 
+    def test_run_batch_reports_a_failed_source_as_failed(self) -> None:
+        import tempfile
+
+        class FailingRuntime:
+            info = self.runtime.info
+
+            def transcribe(self, source, options):
+                raise RuntimeError("broken media")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "file.wav"
+            source.write_bytes(b"audio")
+            progress: list[str] = []
+            run_batch(
+                [SourceMedia(source, Path(source.name))],
+                self.model,
+                Path(temporary),
+                ["txt"],
+                TranscriptionOptions(),
+                False,
+                progress.append,
+                runtime=FailingRuntime(),
+            )
+
+        self.assertTrue(any("] failed " in message for message in progress), progress)
+        self.assertFalse(any("] complete " in message for message in progress), progress)
+
     def test_run_batch_parallel_skips_without_loading_model(self) -> None:
         import tempfile
 

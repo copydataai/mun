@@ -24,7 +24,6 @@ from .transcript import (
     TranscriptResult,
     TranscriptSegment,
     TranscriptVariant,
-    make_batch_result,
     make_provenance,
     render_json,
     render_srt,
@@ -368,7 +367,7 @@ def run_batch(
                 if result.status == "completed":
                     write_result_outputs(base, formats, result, options.translate, overwrite=overwrite)
                 queued_results[index] = result
-                progress(f"[{index}/{len(media)}] complete {item.source}")
+                progress(f"[{index}/{len(media)}] {result.status} {item.source}")
             except KeyboardInterrupt:
                 raise
             except Exception as exc:
@@ -432,7 +431,7 @@ def run_batch(
         summaries.append(result)
         if result.status == "failed":
             failures.append({"source": str(result.source.relative_path), "error": result.diagnostics[0].message if result.diagnostics else "failed"})
-        progress(f"[{index}/{len(media)}] complete {result.source.name}")
+        progress(f"[{index}/{len(media)}] {result.status} {result.source.name}")
 
     return summaries, failures
 

@@ -39,7 +39,11 @@ from .models import (
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="mun", description="Local-first batch speech-to-text")
+    parser = argparse.ArgumentParser(
+        prog="mun",
+        description="Transcribe audio and video on your computer",
+        epilog="Get started: mun transcribe recordings/",
+    )
     parser.add_argument("--version", action="version", version=f"mun {__version__}")
     subcommands = parser.add_subparsers(dest="command")
 
@@ -53,10 +57,10 @@ def build_parser() -> argparse.ArgumentParser:
     transcribe.add_argument("--timestamps", action="store_true", help="include segment timestamps")
     transcribe.add_argument("--language", help="spoken language name or code (Whisper only)")
     transcribe.add_argument("--translate", action="store_true", help="also translate speech to English")
-    transcribe.add_argument("--include-hidden", action="store_true")
-    transcribe.add_argument("--overwrite", action="store_true")
+    transcribe.add_argument("--include-hidden", action="store_true", help="include media inside hidden directories")
+    transcribe.add_argument("--overwrite", action="store_true", help="replace existing transcript files")
     transcribe.add_argument("--device", default=None, help="auto, cpu, mps, or cuda[:index]")
-    transcribe.add_argument("--offline", action="store_true")
+    transcribe.add_argument("--offline", action="store_true", help="disable Hugging Face network access")
     transcribe.add_argument("--stdout", action="store_true", help="write one TXT or JSON result to stdout")
     transcribe.add_argument("--summary-json", action="store_true", help="write batch summary JSON to stdout")
     transcribe.add_argument("--jobs", type=int, default=1, help="parallel batch workers (CPU runs only)")
@@ -133,7 +137,7 @@ def interactive_wizard() -> int:
     print("Mun — local speech-to-text\n")
     config = load_config()
     root = models_root(config)
-    models = [model for model in installed_models(root) if model.status == "ready"]
+    models = [model for model in installed_models(root) if model.status in {"installed", "ready"}]
     if not models:
         default = load_catalog()["models"][0]
         print(f"No speech model is installed. Recommended: {default['id']}")
@@ -142,11 +146,11 @@ def interactive_wizard() -> int:
             print(f"Run 'mun models search' or 'mun models download {default['id']}' when ready.")
             return 0
         download_model(default["id"], root, default["revision"], False, False)
-        models = [model for model in installed_models(root) if model.status == "ready"]
+        models = [model for model in installed_models(root) if model.status in {"installed", "ready"}]
     print("Installed models:")
     for index, model in enumerate(models, start=1):
         print(f"  {index}. {model.id} ({model.revision[:12]})")
-    choice = input(f"Model [1]: ").strip()
+    choice = input("Model [1]: ").strip()
     try:
         model = models[int(choice or "1") - 1]
     except (ValueError, IndexError) as exc:
@@ -156,10 +160,10 @@ def interactive_wizard() -> int:
         raise MunError("At least one file or directory is required")
     output_dir = input("Output directory [transcripts]: ").strip() or "transcripts"
     args = argparse.Namespace(
-        inputs=shlex.split(entered_paths), input_list=None, model=model.id, model_dir=str(root),
+        inputs=shlex.split(entered_paths), input_list=None, model=model.path, model_dir=str(root),
         output_dir=output_dir, format=["txt"], timestamps=False, language=None, translate=False,
         include_hidden=False, overwrite=False, device=None, offline=False, stdout=False,
-        summary_json=False, jobs=1, chunk_length=30, stride_length=5,
+        summary_json=False, jobs=1, benchmark=False, chunk_length=30, stride_length=5,
     )
     return command_transcribe(args)
 
@@ -211,7 +215,9 @@ def command_transcribe(args: argparse.Namespace) -> int:
             sys.stdout.write(render_output(formats[0], result, media[0], model, runtime.info.effective_device))
             return 0
         output_dir = Path(args.output_dir or config.get("output_dir", "transcripts")).expanduser().resolve()
-        progress = lambda message: print(message, file=sys.stderr)
+        def progress(message: str) -> None:
+            print(message, file=sys.stderr)
+
         started_at = time.perf_counter() if args.benchmark else None
         summaries, failures = run_batch(
             media,
@@ -247,7 +253,7 @@ def command_models(args: argparse.Namespace) -> int:
     root = models_root(config, args.model_dir)
     if args.models_command == "search":
         records = search_models(args.query, args.limit, args.offline or config.get("offline", False))
-        _print_records(records, args.json, ("id", "compatibility", "quality", "downloads"))
+        _print_records(records, args.json, ("id", "library", "gated", "downloads"))
         return 0
     if args.models_command == "list":
         records = [asdict(model) for model in installed_models(root)]

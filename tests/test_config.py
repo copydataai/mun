@@ -28,6 +28,15 @@ class ConfigTests(unittest.TestCase):
                 with self.assertRaisesRegex(MunError, "Unknown configuration field"):
                     load_config()
 
+    def test_string_values_with_control_characters_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            value = "folder/" + "".join(chr(codepoint) for codepoint in range(32)) + "\x7f/café/🌙"
+            with patch("mun.config.config_path", return_value=path):
+                set_config("output_dir", value)
+                self.assertEqual(load_config()["output_dir"], value)
+                self.assertNotIn("\x7f", path.read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()

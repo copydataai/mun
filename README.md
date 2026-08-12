@@ -1,79 +1,100 @@
 # Mun
 
-Mun is a local-first command-line tool that turns batches of audio and video into text with speech models from Hugging Face. Media and transcripts remain on your computer; the network is used only to search for and download models.
+**Private transcription for audio and video, on your own computer.**
 
-> **Alpha:** the plain-transcription path is the first supported milestone. Timestamped subtitles and Whisper translation are included. Speaker diarization is planned but not yet implemented.
+Mun turns one file—or a whole folder—into plain transcripts, JSON, or subtitles with a speech model you choose. Your media is processed locally and your transcripts stay yours. The network is used only to find and download models from Hugging Face.
 
-## Requirements
+```sh
+mun transcribe interview.m4a
+```
+
+Mun is intentionally small: a command-line tool, a local model, and files you can keep or move anywhere.
+
+> **Alpha:** plain transcription, timestamped subtitles, and Whisper translation work today. Speaker diarization is planned, but not implemented.
+
+## Why Mun
+
+- **Private by design.** Audio and video are never sent to a transcription service. Mun has no telemetry.
+- **Made for real folders.** Pass files and directories together; Mun discovers readable media recursively, preserves its structure, and continues past transcription failures.
+- **Safe and inspectable.** Models are pinned to immutable revisions, existing transcripts are not overwritten by default, and JSON results record model and runtime provenance.
+
+## Quick start
+
+### 1. Install Mun from a checkout
+
+Mun requires:
 
 - macOS 13+ on Apple Silicon, or a current x86-64 Linux distribution
 - Python 3.11 or 3.12
-- [FFmpeg](https://ffmpeg.org/) (`ffmpeg` and `ffprobe` must be on `PATH`)
-- Enough disk and memory for your selected model
+- [FFmpeg](https://ffmpeg.org/) (`ffmpeg` and `ffprobe` on `PATH`)
+- Enough disk and memory for the model you select
 
-On macOS:
+macOS:
 
 ```sh
 brew install ffmpeg uv
+uv tool install --python 3.11 .
 ```
 
-On Ubuntu or Debian:
+Ubuntu or Debian:
 
 ```sh
 sudo apt install ffmpeg pipx
+pipx install .
 ```
 
-## Install
-
-From a checkout:
+Then verify the installation:
 
 ```sh
-uv tool install .
 mun doctor
 ```
 
-For development:
+CUDA and ROCm require the PyTorch build appropriate for your system. Use the [official PyTorch installation selector](https://pytorch.org/get-started/locally/); Mun detects the backend but does not change its own environment.
+
+### 2. Transcribe
+
+Run `mun` with no arguments for the guided workflow. On first use, Mun shows a pinned multilingual model, its download size, and its license before asking permission to download it.
+
+Or use the scriptable workflow:
 
 ```sh
-uv sync
-uv run mun --help
-```
-
-CUDA and ROCm need the PyTorch build appropriate for your system. Follow the [official PyTorch installation selector](https://pytorch.org/get-started/locally/); Mun detects the backend but does not modify its own environment.
-
-## First run
-
-Run `mun` in a terminal for the guided workflow. On first use it recommends a pinned multilingual model, shows its download size and license, and asks before downloading anything.
-
-The same workflow is scriptable:
-
-```sh
-mun models search whisper
 mun models download openai/whisper-small
 mun transcribe interview.m4a
 ```
 
-Transcripts go to `./transcripts/` by default. Existing output is skipped unless `--overwrite` is supplied.
+Transcripts are written to `./transcripts/`. Existing files are skipped unless you pass `--overwrite`.
 
-## Batch transcription
+## Common workflows
 
-Pass any mixture of files and directories. Directories are scanned recursively; hidden directories and symlinked directories are skipped.
+### Transcribe a folder
 
 ```sh
-mun transcribe recordings/ meeting.mp4 voice-note.m4a
-mun transcribe --input-list files.txt --format txt --format json
-mun transcribe recordings/ --format srt --format vtt
-mun transcribe recordings/ --jobs 4 --format txt
-mun transcribe recordings/ --jobs 4 --benchmark --format txt
+mun transcribe recordings/
 ```
 
-`--jobs` enables parallel workers for large file batches. For safety, Mun currently uses it only with CPU inference. If you are on an accelerator backend, the flag is ignored and runs in single-process mode.
+Directories are scanned recursively. Hidden directories and symlinked directories are skipped by default.
 
-`--benchmark` prints batch throughput metrics to stderr after the batch completes. This is especially useful for tuning `--jobs` and format mix.
+### Mix files and folders
 
-FFmpeg converts each source to private temporary mono audio. Temporary audio is removed after success, failure, or cancellation. By default, one speech model is loaded and inference runs sequentially so concurrent files do not duplicate model memory. Enable `--jobs` for CPU batches when you want higher throughput.
+```sh
+mun transcribe meetings/ interview.mp4 voice-note.m4a
+```
 
-### Language and English translation
+### Create text and structured JSON
+
+```sh
+mun transcribe recordings/ --format txt --format json
+```
+
+### Create subtitles
+
+```sh
+mun transcribe recordings/ --format srt --format vtt
+```
+
+SRT and VTT automatically enable timestamps.
+
+### Translate speech into English
 
 Language selection and translation require a compatible multilingual Whisper-family model:
 
@@ -81,52 +102,67 @@ Language selection and translation require a compatible multilingual Whisper-fam
 mun transcribe spanish.m4a --language Spanish --translate
 ```
 
-Translation preserves both outputs, for example `spanish.original.txt` and `spanish.en.txt`. Without `--language`, compatible Whisper models choose the spoken language automatically; this is not exposed as a reliable detected-language metadata field because Transformers does not standardize that output.
+Mun preserves both variants, such as `spanish.original.txt` and `spanish.en.txt`. Without `--language`, compatible Whisper models choose the spoken language automatically. Mun does not claim detected-language metadata because Transformers does not expose it consistently.
 
-### Output formats
+### Process large CPU batches in parallel
 
-- `txt` — default plain transcript
-- `json` — versioned structured transcript and segments
-- `srt` — SubRip subtitles; enables timestamps
-- `vtt` — WebVTT subtitles; enables timestamps
+```sh
+mun transcribe recordings/ --jobs 4
+mun transcribe recordings/ --jobs 4 --benchmark
+```
 
-Machine-readable single-file output:
+`--jobs` uses parallel workers for CPU inference. Accelerator runs remain single-process to avoid duplicating model memory. `--benchmark` reports elapsed time and file throughput to stderr.
+
+### Use Mun in a script
+
+One source media file to stdout:
 
 ```sh
 mun transcribe audio.wav --stdout --format json > transcript.json
 ```
 
-Machine-readable batch summary:
+A machine-readable batch result:
 
 ```sh
 mun transcribe recordings/ --summary-json > result.json
 ```
 
-Progress and warnings are written to stderr, so redirected stdout stays valid.
+Progress and warnings go to stderr, so redirected stdout remains valid.
+
+## Outputs
+
+| Format | Purpose |
+|---|---|
+| `txt` | Plain transcript; the default |
+| `json` | Versioned transcript result with segments, diagnostics, and provenance |
+| `srt` | SubRip subtitles with timestamps |
+| `vtt` | WebVTT subtitles with timestamps |
+
+Mun writes each file atomically: an incomplete transcript is never moved into its final path. Files rejected during media discovery are skipped; if transcription fails after processing begins, completed transcripts are preserved, the remaining files continue, and Mun exits nonzero.
+
+FFmpeg converts source media into temporary mono audio when needed. Temporary audio is removed after success, failure, or cancellation. Media already suitable for inference can bypass conversion.
 
 ## Models
 
-Mun stores complete pinned snapshots in its own model directory. It does not delete or mutate Hugging Face's global cache.
+Mun stores complete, pinned model snapshots in its own model directory. It does not delete or mutate Hugging Face's global cache.
 
 ```sh
-mun models search --limit 20
+mun models search whisper
 mun models download OWNER/MODEL
 mun models list
 mun models info OWNER/MODEL
 mun models remove OWNER/MODEL
 ```
 
-Search results have honest compatibility labels:
+Search is discovery, not qualification. It reports repository metadata such as model ID, library, gating, and popularity, but does not label a model `eligible` or `tested` without the exact revision, runtime, device, precision, and requested capability tuple required to support that claim.
 
-- `tested` — a pinned revision verified on named hardware in Mun's reviewed catalog
-- `metadata-compatible` — Hugging Face metadata says ASR + Transformers; loading is the real validation
-- `unsupported` — wrong pipeline or runtime
+`gated` is visible in search results when downloading requires upstream terms and Hugging Face authentication. `installed` appears in `mun models list` only after pinned artifacts are present locally.
 
-Model-card metrics are not treated as comparable accuracy scores. Catalogued models remain `metadata-compatible` until a live device test is recorded; other untested models are marked `unverified` because datasets, preprocessing, languages, and metrics differ.
+Mun does not present model-card metrics as comparable accuracy scores. Datasets, languages, preprocessing, and metrics differ too much for that claim.
 
 ### Remote model code
 
-Remote repository code is disabled by default. A model that needs it requires `--trust-remote-code`, displays a warning, and is pinned to an immutable commit. This executes third-party Python locally; inspect and trust the repository before opting in.
+Remote repository code is disabled by default. A model that requires it needs `--trust-remote-code`; Mun displays a warning and pins the model to an immutable commit. This executes third-party Python locally, so inspect and trust the repository before opting in.
 
 Gated models use the standard Hugging Face login:
 
@@ -134,11 +170,11 @@ Gated models use the standard Hugging Face login:
 hf auth login
 ```
 
-Mun never stores your token in its configuration.
+Mun never stores your Hugging Face token in its configuration.
 
 ## Offline mode
 
-After downloading a model:
+Once a model is installed, transcription can run with Hugging Face network access disabled:
 
 ```sh
 mun transcribe audio.wav --offline
@@ -146,11 +182,11 @@ mun models search --offline
 mun config set offline true
 ```
 
-Offline search shows only Mun's built-in tested catalog. Downloads are rejected.
+Offline search uses Mun's built-in catalog. Model downloads are rejected.
 
 ## Configuration
 
-CLI flags override the user-level TOML file.
+CLI flags override the user-level TOML configuration:
 
 ```sh
 mun config show
@@ -164,22 +200,24 @@ Supported keys are `model`, `model_dir`, `output_dir`, `device`, and `offline`.
 
 ## Troubleshooting
 
-Run:
-
 ```sh
 mun doctor
 mun doctor --json
 ```
 
-It checks Python, FFmpeg, PyTorch, the detected device, disk space, and installed models while redacting the home-directory prefix. Mun collects no telemetry.
+`mun doctor` checks Python, FFmpeg, PyTorch, the detected device, disk space, and installed models. Home-directory paths are redacted.
 
-If MPS hits an unsupported PyTorch operation, retry on CPU:
+If MPS encounters an unsupported PyTorch operation, retry on CPU:
 
 ```sh
 mun transcribe audio.wav --device cpu
 ```
 
-If a batch contains a bad file, Mun continues with the remaining files, reports failures, and exits nonzero. Shared failures such as a model that cannot load stop before processing. Completed output is preserved; incomplete output is never renamed into place.
+## Scope
+
+Mun does not provide cloud inference, a web server, transcript editing, summarization, speaker recognition, training, fine-tuning, or model conversion. Speaker diarization is the next optional capability only if its gated model and dependencies can remain separate from plain transcription.
+
+A graphical interface may eventually wrap the same workflow. Mun has no GUI dependency or implementation scaffold today.
 
 ## Development
 
@@ -188,14 +226,8 @@ uv run python -m unittest discover -s tests -v
 uv build
 ```
 
-Normal tests do not download models. A live transcription smoke test is intentionally manual because even small models add network time and hundreds of megabytes.
-
-## Scope
-
-Mun does not provide cloud inference, a web server, transcript editing, summarization, speaker recognition, training, fine-tuning, or speech-model conversion. Speaker diarization is the next optional capability once its gated model and dependency flow can be kept separate from plain transcription.
-
-A GUI may eventually wrap the same core workflow. There is no GUI dependency or implementation scaffold today.
+Normal tests do not download models. Live transcription remains an explicit manual smoke test because even small models add network time and hundreds of megabytes.
 
 ## License
 
-Mun is licensed under Apache-2.0. Downloaded models retain their own licenses; review the model details before use.
+Mun is licensed under Apache-2.0. Downloaded models keep their own licenses; review model details before use.

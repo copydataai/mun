@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import contextlib
 import io
 import tempfile
@@ -8,13 +9,79 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from mun.cli import _existing_ancestor, build_parser, command_transcribe, main
+from mun.cli import _existing_ancestor, build_parser, command_transcribe, interactive_wizard, main
 from mun.core import SourceMedia
 from mun.models import InstalledModel
 from mun.transcript import SourceRecord, TranscriptResult, make_provenance
 
 
 class CliTests(unittest.TestCase):
+    def test_guided_workflow_uses_an_installed_model_without_downloading_again(self) -> None:
+        model = InstalledModel(
+            "owner/model",
+            "abc123",
+            "/models/owner--model",
+            "2026-08-11T00:00:00+00:00",
+            status="installed",
+        )
+        captured: list[argparse.Namespace] = []
+
+        def fake_transcribe(args: argparse.Namespace) -> int:
+            captured.append(args)
+            return 0
+
+        with patch("mun.cli.load_config", return_value={}), \
+            patch("mun.cli.models_root", return_value=Path("/models")), \
+            patch("mun.cli.installed_models", return_value=[model]), \
+            patch("mun.cli.download_model") as download, \
+            patch("builtins.input", side_effect=["", "voice.wav", ""]), \
+            patch("mun.cli.command_transcribe", side_effect=fake_transcribe):
+            status = interactive_wizard()
+
+        self.assertEqual(status, 0)
+        download.assert_not_called()
+        self.assertEqual(captured[0].model, "/models/owner--model")
+        self.assertFalse(captured[0].benchmark)
+
+    def test_guided_workflow_uses_a_model_immediately_after_download(self) -> None:
+        model = InstalledModel(
+            "owner/model",
+            "abc123",
+            "/models/owner--model",
+            "2026-08-11T00:00:00+00:00",
+            status="installed",
+        )
+        captured: list[argparse.Namespace] = []
+
+        def fake_transcribe(args: argparse.Namespace) -> int:
+            captured.append(args)
+            return 0
+
+        with patch("mun.cli.load_config", return_value={}), \
+            patch("mun.cli.models_root", return_value=Path("/models")), \
+            patch("mun.cli.installed_models", side_effect=[[], [model]]), \
+            patch("mun.cli.load_catalog", return_value={"models": [{
+                "id": "owner/model",
+                "revision": "abc123",
+                "weights_bytes": 1024,
+                "license": "apache-2.0",
+            }]}), \
+            patch("mun.cli._confirm", return_value=True), \
+            patch("mun.cli.download_model", return_value=model) as download, \
+            patch("builtins.input", side_effect=["", "voice.wav", ""]), \
+            patch("mun.cli.command_transcribe", side_effect=fake_transcribe):
+            status = interactive_wizard()
+
+        self.assertEqual(status, 0)
+        download.assert_called_once_with("owner/model", Path("/models"), "abc123", False, False)
+        self.assertEqual(captured[0].model, "/models/owner--model")
+
+    def test_help_describes_the_product_and_common_workflow(self) -> None:
+        help_text = build_parser().format_help()
+
+        self.assertIn("Transcribe audio and video on your computer", help_text)
+        self.assertIn("mun transcribe recordings/", help_text)
+
     def test_transcribe_defaults_parse(self) -> None:
         args = build_parser().parse_args(["transcribe", "voice.wav"])
         self.assertEqual(args.inputs, ["voice.wav"])

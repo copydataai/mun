@@ -63,11 +63,10 @@ def find_installed(root: Path, model_id: str | None) -> InstalledModel:
 
 def search_models(query: str | None, limit: int, offline: bool) -> list[dict[str, Any]]:
     catalog = load_catalog()["models"]
-    tested = {model["id"]: model for model in catalog}
     if offline:
         needle = (query or "").lower()
         return [
-            {**model, "compatibility": _catalog_compatibility(model)}
+            _catalog_search_record(model)
             for model in catalog
             if not needle or needle in model["id"].lower()
         ][:limit]
@@ -81,7 +80,7 @@ def search_models(query: str | None, limit: int, offline: bool) -> list[dict[str
             limit=limit,
             expand=["pipeline_tag", "library_name", "downloads", "likes", "gated", "tags", "sha"],
         )
-        return [_search_record(model, tested) for model in results]
+        return [_search_record(model) for model in results]
     except Exception as exc:
         raise MunError(f"Hugging Face search failed: {exc}") from exc
 
@@ -215,29 +214,28 @@ def _write_metadata(directory: Path, model: InstalledModel) -> None:
     temporary.replace(path)
 
 
-def _search_record(model: Any, tested: dict[str, Any]) -> dict[str, Any]:
+def _catalog_search_record(model: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": model["id"],
+        "revision": model.get("revision"),
+        "library": model.get("library", "transformers"),
+        "pipeline": model.get("pipeline", "automatic-speech-recognition"),
+        "gated": bool(model.get("gated", False)),
+        "license": model.get("license", "unknown"),
+    }
+
+
+def _search_record(model: Any) -> dict[str, Any]:
     library = getattr(model, "library_name", None)
-    pipeline_tag = getattr(model, "pipeline_tag", None)
-    if model.id in tested and _catalog_compatibility(tested[model.id]) == "tested":
-        compatibility = "tested"
-    elif pipeline_tag == "automatic-speech-recognition" and library in {None, "transformers"}:
-        compatibility = "metadata-compatible"
-    else:
-        compatibility = "unsupported"
     return {
         "id": model.id,
         "revision": getattr(model, "sha", None),
         "library": library or "unknown",
+        "pipeline": getattr(model, "pipeline_tag", None) or "unknown",
         "downloads": getattr(model, "downloads", 0) or 0,
         "likes": getattr(model, "likes", 0) or 0,
-        "gated": getattr(model, "gated", False),
-        "compatibility": compatibility,
-        "quality": tested.get(model.id, {}).get("quality", "unverified"),
+        "gated": bool(getattr(model, "gated", False)),
     }
-
-
-def _catalog_compatibility(model: dict[str, Any]) -> str:
-    return "tested" if model.get("tested", {}).get("device") not in {None, "unverified"} else "metadata-compatible"
 
 
 def _download_plan(siblings: list[Any]) -> tuple[int, list[str]]:

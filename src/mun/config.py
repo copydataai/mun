@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tomllib
@@ -71,8 +72,9 @@ def reset_config() -> bool:
 def _toml_value(value: Any) -> str:
     if isinstance(value, bool):
         return str(value).lower()
-    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{escaped}"'
+    # JSON and TOML basic strings share the escapes emitted here for U+0000–U+001F.
+    # TOML additionally forbids a literal U+007F, which JSON leaves unescaped.
+    return json.dumps(str(value), ensure_ascii=False).replace("\x7f", "\\u007f")
 
 
 def _atomic_write(path: Path, content: str) -> None:
